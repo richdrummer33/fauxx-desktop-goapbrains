@@ -256,6 +256,15 @@ fn print_report(report: &DryRunReport) {
             .collect();
         println!("topic_scores:    {}", scores.join(" "));
     }
+    if !s.needs.levels.is_empty() {
+        let needs: Vec<String> = s
+            .needs
+            .levels
+            .iter()
+            .map(|(k, v)| format!("{k}={v:.2}"))
+            .collect();
+        println!("needs:           {}", needs.join(" "));
+    }
     if report.idle {
         println!("decision:        IDLE (no action this tick)");
     }
@@ -269,15 +278,26 @@ fn print_report(report: &DryRunReport) {
     }
     if let Some(goal) = &report.selected_goal {
         println!("selected_goal:   {} ({})", goal.goal_type, goal.id);
-        println!("action_type:     {}", goal.action_type);
         println!(
-            "category:        {}{}",
-            goal.category,
-            goal.subcategory
-                .as_deref()
-                .map(|s| format!(" / {s}"))
-                .unwrap_or_default()
+            "need:            {}  [{}]",
+            goal.need,
+            if goal.online {
+                "online search"
+            } else {
+                "offline errand"
+            }
         );
+        println!("action_type:     {}", goal.action_type);
+        if goal.online {
+            println!(
+                "category:        {}{}",
+                goal.category,
+                goal.subcategory
+                    .as_deref()
+                    .map(|s| format!(" / {s}"))
+                    .unwrap_or_default()
+            );
+        }
         println!("reason:          {}", goal.reason);
     }
     println!("sidecar_used:    {}", report.sidecar_used);
@@ -295,7 +315,12 @@ fn print_report(report: &DryRunReport) {
         }
     }
     println!("final_plan:");
-    if report.final_plan.is_empty() {
+    if let Some(goal) = report.selected_goal.as_ref().filter(|g| !g.online) {
+        println!(
+            "  (offline errand: {})",
+            goal.subcategory.as_deref().unwrap_or(&goal.need)
+        );
+    } else if report.final_plan.is_empty() {
         println!("  (nothing to do)");
     } else {
         for i in &report.final_plan {

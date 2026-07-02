@@ -100,6 +100,53 @@ pub struct PersonaPolicy {
     /// Planner tuning (candidate count, dwell ranges, sidecar toggle).
     #[serde(default)]
     pub planner_settings: PlannerSettings,
+    /// Life domains: the needs/motives this persona services and how (online
+    /// search vs offline real-world errand). Additive: when empty, a single
+    /// online `hobby` domain is synthesized from [`allowed_categories`], so a
+    /// policy that predates domains behaves exactly as before.
+    #[serde(default)]
+    pub domains: Vec<Domain>,
+}
+
+/// A life domain: a need/motive the persona services, and how it does so. A
+/// domain with categories and a high `online_bias` is mostly satisfied by decoy
+/// SEARCHES; a domain with no categories (or a low `online_bias`) is satisfied
+/// OFFLINE, in the real world, emitting nothing on the wire. Offline domains are
+/// how a persona attends to sensitive real-life needs (health, errands) WITHOUT
+/// ever turning them into decoy query signal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Domain {
+    /// The need this domain serves (e.g. `hobby`, `upkeep`, `wellbeing`).
+    pub name: String,
+    /// [`CategoryPool`] names this domain searches online (empty = offline-only).
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Probability in `[0, 1]` that servicing this need is an ONLINE search
+    /// rather than an offline errand. `0.0` = always offline.
+    #[serde(default = "default_online_bias")]
+    pub online_bias: f64,
+    /// How fast this need depletes, per hour.
+    #[serde(default = "default_decay_per_hour")]
+    pub decay_per_hour: f64,
+    /// How much one action replenishes this need.
+    #[serde(default = "default_satisfy_amount")]
+    pub satisfy_amount: f64,
+    /// Flavor label for an offline action (e.g. `goes for a walk`).
+    #[serde(default)]
+    pub offline_label: Option<String>,
+    /// Goal-type labels this domain favors.
+    #[serde(default)]
+    pub goal_types: Vec<String>,
+}
+
+fn default_online_bias() -> f64 {
+    0.9
+}
+fn default_decay_per_hour() -> f64 {
+    0.06
+}
+fn default_satisfy_amount() -> f64 {
+    0.4
 }
 
 fn default_schema_version() -> u32 {
@@ -435,6 +482,10 @@ pub enum PolicyIssue {
     /// A forbidden capability required by the hard list is missing from the
     /// policy's `forbidden_capabilities`.
     MissingHardForbidden(String),
+    /// A domain references a category that is not in `allowed_categories`.
+    DomainCategoryNotAllowed { domain: String, name: String },
+    /// A domain's `online_bias` is outside `[0, 1]`.
+    InvalidOnlineBias { domain: String },
 }
 
 impl PersonaPolicy {
@@ -543,6 +594,30 @@ impl PersonaPolicy {
             issues.push(PolicyIssue::InvertedDwellRange);
         }
 
+        // Domains: each searched category must be a known, ALLOWED category, and
+        // the online bias must be a probability. Offline-only domains (no
+        // categories) are fine.
+        for domain in &self.domains {
+            for cat in &domain.categories {
+                if CategoryPool::from_name(cat).is_none() {
+                    issues.push(PolicyIssue::UnknownCategory {
+                        field: "domains.categories",
+                        name: cat.clone(),
+                    });
+                } else if !self.allowed_categories.contains(cat) {
+                    issues.push(PolicyIssue::DomainCategoryNotAllowed {
+                        domain: domain.name.clone(),
+                        name: cat.clone(),
+                    });
+                }
+            }
+            if !(0.0..=1.0).contains(&domain.online_bias) {
+                issues.push(PolicyIssue::InvalidOnlineBias {
+                    domain: domain.name.clone(),
+                });
+            }
+        }
+
         // Every hard-forbidden capability must be present (a policy may add, not
         // remove). Belt and suspenders: the Safety Gate refuses them anyway.
         for cap in HARD_FORBIDDEN_CAPABILITIES {
@@ -566,6 +641,31 @@ impl PersonaPolicy {
             .iter()
             .filter_map(|n| CategoryPool::from_name(n))
             .collect()
+    }
+
+    /// The persona's life domains, synthesizing a single online `hobby` domain
+    /// from [`allowed_categories`](Self::allowed_categories) when none are
+    /// declared (so a pre-domains policy behaves exactly as before).
+    pub fn effective_domains(&self) -> Vec<Domain> {
+        if !self.domains.is_empty() {
+            return self.domains.clone();
+        }
+        vec![Domain {
+            name: "hobby".to_string(),
+            categories: self.allowed_categories.clone(),
+            online_bias: 1.0,
+            decay_per_hour: default_decay_per_hour(),
+            satisfy_amount: default_satisfy_amount(),
+            offline_label: None,
+            goal_types: Vec::new(),
+        }]
+    }
+
+    /// The domain serving `need`, if any.
+    pub fn domain_by_need(&self, need: &str) -> Option<Domain> {
+        self.effective_domains()
+            .into_iter()
+            .find(|d| d.name == need)
     }
 
     /// The first routine covering `is_weekend`/`hour`, or `None` (quiet hours).
@@ -742,6 +842,48 @@ categories = ["TECHNOLOGY"]
         assert!(!policy.is_capability_forbidden("search"));
         assert!(policy.is_module_allowed("search"));
         assert!(!policy.is_module_allowed("form_fill"));
+        Ok(())
+    }
+
+    #[test]
+    fn no_domains_synthesizes_a_hobby_domain() -> crate::Result<()> {
+        let policy = PersonaPolicy::from_toml_str(minimal_toml())?;
+        let domains = policy.effective_domains();
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].name, "hobby");
+        assert_eq!(domains[0].categories, policy.allowed_categories);
+        Ok(())
+    }
+
+    #[test]
+    fn domain_category_must_be_allowed_and_known() -> crate::Result<()> {
+        let toml = format!(
+            "{}\n[[domains]]\nname = \"junk\"\ncategories = [\"FINANCE\", \"NOPE\"]\n",
+            minimal_toml()
+        );
+        let policy = PersonaPolicy::from_toml_str(&toml)?;
+        let issues = policy.validate();
+        // FINANCE is a real category but not in allowed_categories; NOPE is unknown.
+        assert!(issues.iter().any(
+            |i| matches!(i, PolicyIssue::DomainCategoryNotAllowed { name, .. } if name == "FINANCE")
+        ));
+        assert!(issues
+            .iter()
+            .any(|i| matches!(i, PolicyIssue::UnknownCategory { name, .. } if name == "NOPE")));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_online_bias_is_flagged() -> crate::Result<()> {
+        let toml = format!(
+            "{}\n[[domains]]\nname = \"hobby\"\ncategories = [\"TECHNOLOGY\"]\nonline_bias = 1.5\n",
+            minimal_toml()
+        );
+        let policy = PersonaPolicy::from_toml_str(&toml)?;
+        assert!(policy
+            .validate()
+            .iter()
+            .any(|i| matches!(i, PolicyIssue::InvalidOnlineBias { domain } if domain == "hobby")));
         Ok(())
     }
 

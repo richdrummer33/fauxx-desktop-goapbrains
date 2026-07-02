@@ -295,14 +295,17 @@ mod tests {
         let mut state = BehaviorState::new("elias_rickensworth");
         let t = ts(4, 20);
         let tick = kernel.advance(&mut state, policy, t);
-        for seed in 0..100u64 {
+        for seed in 0..200u64 {
             let mut rng = StdRng::seed_from_u64(seed);
             let sel = GoalLayer.select(policy, &state, &tick, t, &mut rng);
             if let Some(goal) = sel.goal {
-                return (goal, state);
+                // The planner only produces intents for ONLINE (search) goals.
+                if goal.online {
+                    return (goal, state);
+                }
             }
         }
-        panic!("could not obtain a goal");
+        panic!("could not obtain an online goal");
     }
 
     #[test]

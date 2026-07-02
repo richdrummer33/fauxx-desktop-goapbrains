@@ -37,7 +37,7 @@ use std::collections::HashMap;
 
 use crate::persona::CategoryPool;
 use crate::persona_engine::kernel::{BehaviorState, TickContext};
-use crate::persona_engine::policy::PersonaPolicy;
+use crate::persona_engine::policy::{Domain, PersonaPolicy, Routine};
 use crate::persona_engine::utility;
 
 /// A concrete goal chosen by the goal layer for one tick.
@@ -49,9 +49,14 @@ pub struct DecoyGoal {
     pub persona_id: String,
     /// The routine that produced this goal.
     pub routine: String,
+    /// The need/motive (life domain) this goal services (e.g. `hobby`, `upkeep`).
+    pub need: String,
+    /// Whether this goal runs ONLINE (a decoy search) or OFFLINE (a real-world
+    /// errand that emits nothing on the wire).
+    pub online: bool,
     /// The goal-type label (e.g. `continue_hobby_thread`).
     pub goal_type: String,
-    /// The action type (MVP: always `search`; page_visit rides as a module).
+    /// The action type: `search` for online, `offline` for a real-world errand.
     pub action_type: String,
     /// The chosen [`CategoryPool`] name (drives the real query generator).
     pub category: String,
@@ -131,93 +136,72 @@ impl GoalLayer {
             };
         }
 
-        // Candidate categories: the routine's categories intersected with the
-        // policy's allowed set; fall back to the whole allowed set.
         let routine = policy.routines.iter().find(|r| r.name == routine_name);
-        let allowed = policy.allowed_category_pool();
-        let mut candidates: Vec<CategoryPool> = match routine {
-            Some(r) if !r.categories.is_empty() => r
-                .categories
-                .iter()
-                .filter_map(|n| CategoryPool::from_name(n))
-                .filter(|c| allowed.contains(c))
-                .collect(),
-            _ => allowed.clone(),
-        };
-        if candidates.is_empty() {
-            candidates = allowed;
-        }
-        if candidates.is_empty() {
+        let temperature = BASE_TEMPERATURE + policy.topic_decay.pivot_probability;
+
+        // --- DESIRE: choose which NEED (life domain) to service this session ---
+        // The most-deficient need pulls hardest, weighted by how well the domain
+        // fits the current routine; drawn with a temperature softmax.
+        let domains = policy.effective_domains();
+        let desires: Vec<f64> = domains
+            .iter()
+            .map(|d| domain_desire(d, routine, state))
+            .collect();
+        let Some(domain_idx) = utility::softmax_choose(&desires, temperature, rng) else {
             return GoalSelection {
                 goal: None,
                 scores: Vec::new(),
                 idle: true,
-                note: "no allowed categories to pursue".to_string(),
+                note: "no life domain to service".to_string(),
+            };
+        };
+        let domain = &domains[domain_idx];
+
+        // --- Decide ONLINE (decoy search) vs OFFLINE (real-world, no traffic) ---
+        let online_candidates: Vec<CategoryPool> = domain
+            .categories
+            .iter()
+            .filter_map(|n| CategoryPool::from_name(n))
+            .filter(|c| policy.allowed_categories.iter().any(|a| a == c.as_name()))
+            .collect();
+        let go_online = !online_candidates.is_empty() && rng.random::<f64>() < domain.online_bias;
+
+        if !go_online {
+            // Offline action: attend to the need in the real world. Nothing goes
+            // on the wire, which is exactly how a sensitive need (health, errands)
+            // is served WITHOUT ever becoming decoy query signal.
+            return GoalSelection {
+                goal: Some(offline_goal(policy, domain, &routine_name, tick.hour)),
+                scores: Vec::new(),
+                idle: false,
+                note: format!("offline: servicing '{}' in the real world", domain.name),
             };
         }
 
-        // Score each candidate with the utility model (Sims-like considerations:
-        // affinity, momentum, novelty, satiation, cooldown), then draw the winner
-        // with a temperature softmax so variety and boring pivots EMERGE from the
-        // sampling rather than a separate coin flip.
-        let max_momentum = candidates
-            .iter()
-            .map(|c| state.topic_score(c.as_name()))
-            .fold(0.0_f64, f64::max)
-            .max(1.0);
-        let affinity = routine_affinity(policy);
-        let recent_len = state.recent_topics.len().max(1) as f64;
-        let scored: Vec<(CategoryPool, f64)> = candidates
-            .iter()
-            .map(|&c| {
-                let name = c.as_name();
-                let momentum = state.topic_score(name) / max_momentum;
-                let novelty = (1.0 - momentum).clamp(0.0, 1.0) * state.curiosity;
-                let recency = state
-                    .recent_topics
-                    .iter()
-                    .filter(|t| t.as_str() == name)
-                    .count() as f64
-                    / recent_len;
-                let cons = utility::Considerations {
-                    affinity: affinity.get(name).copied().unwrap_or(0.5),
-                    momentum,
-                    novelty,
-                    recency,
-                    on_cooldown: state.on_cooldown(&format!("category:{name}"), now),
-                };
-                (c, utility::score(&cons))
-            })
-            .collect();
-
-        let raw_scores: Vec<f64> = scored.iter().map(|(_, s)| *s).collect();
-        let temperature = BASE_TEMPERATURE + policy.topic_decay.pivot_probability;
-        let Some(chosen_idx) = utility::softmax_choose(&raw_scores, temperature, rng) else {
+        // --- GOAL: pick a category within the domain via the utility model ---
+        let Some((scored, chosen_idx)) =
+            pick_category(policy, &online_candidates, state, now, rng, temperature)
+        else {
+            // Everything the domain could search is on cooldown; do it offline
+            // rather than forcing a repeat.
             return GoalSelection {
-                goal: None,
-                scores: score_labels(&scored),
-                idle: true,
-                note: "every candidate category is on cooldown".to_string(),
+                goal: Some(offline_goal(policy, domain, &routine_name, tick.hour)),
+                scores: Vec::new(),
+                idle: false,
+                note: format!("offline fallback: '{}' categories on cooldown", domain.name),
             };
         };
         let category = scored[chosen_idx].0;
-        // A "pivot" is just when the sampler did not land on the top-scoring
-        // option; used only to flavor the human-readable reason.
-        let pivot = utility::argmax(&raw_scores) != Some(chosen_idx);
+        let raw: Vec<f64> = scored.iter().map(|(_, s)| *s).collect();
+        // A "pivot" is just when the sampler did not land on the top scorer;
+        // used only to flavor the reason.
+        let pivot = utility::argmax(&raw) != Some(chosen_idx);
 
         // Subcategory: walk THROUGH the persona's seeds for this category,
         // preferring one not used recently (interest threading), so consecutive
         // sessions progress (ink -> blotting paper) instead of repeating one.
         let subcategory = choose_seed(policy, category, state, rng);
-
-        // Goal type from the routine (rng pick), or a sensible default.
-        let goal_type = match routine {
-            Some(r) if !r.goal_types.is_empty() => {
-                r.goal_types[rng.random_range(0..r.goal_types.len())].clone()
-            }
-            _ => "browse_topic".to_string(),
-        };
-
+        let goal_type = pick_goal_type(domain, routine, rng);
         let reason = build_reason(
             policy,
             &routine_name,
@@ -236,6 +220,8 @@ impl GoalLayer {
             ),
             persona_id: policy.id.clone(),
             routine: routine_name,
+            need: domain.name.clone(),
+            online: true,
             goal_type,
             action_type: "search".to_string(),
             category: category.as_name().to_string(),
@@ -255,6 +241,125 @@ impl GoalLayer {
             idle: false,
             note: "goal selected".to_string(),
         }
+    }
+}
+
+/// The desire to service a domain's need this session: its deficit, weighted by
+/// how well the domain fits the current routine. Offline-only domains stay
+/// somewhat eligible at any time (real life does not keep a schedule).
+fn domain_desire(domain: &Domain, routine: Option<&Routine>, state: &BehaviorState) -> f64 {
+    let deficit = state.needs.deficit(&domain.name);
+    let fit = if domain.categories.is_empty() {
+        0.6
+    } else if routine.is_some_and(|r| {
+        domain
+            .categories
+            .iter()
+            .any(|c| r.categories.iter().any(|rc| rc == c))
+    }) {
+        1.0
+    } else {
+        0.5
+    };
+    fit * (0.2 + deficit)
+}
+
+/// Score the domain's candidate categories with the utility model and draw one
+/// with a temperature softmax. `None` when every candidate is on cooldown.
+fn pick_category(
+    policy: &PersonaPolicy,
+    candidates: &[CategoryPool],
+    state: &BehaviorState,
+    now: i64,
+    rng: &mut impl RngExt,
+    temperature: f64,
+) -> Option<(Vec<(CategoryPool, f64)>, usize)> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let max_momentum = candidates
+        .iter()
+        .map(|c| state.topic_score(c.as_name()))
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let affinity = routine_affinity(policy);
+    let recent_len = state.recent_topics.len().max(1) as f64;
+    let scored: Vec<(CategoryPool, f64)> = candidates
+        .iter()
+        .map(|&c| {
+            let name = c.as_name();
+            let momentum = state.topic_score(name) / max_momentum;
+            let novelty = (1.0 - momentum).clamp(0.0, 1.0) * state.curiosity;
+            let recency = state
+                .recent_topics
+                .iter()
+                .filter(|t| t.as_str() == name)
+                .count() as f64
+                / recent_len;
+            let cons = utility::Considerations {
+                affinity: affinity.get(name).copied().unwrap_or(0.5),
+                momentum,
+                novelty,
+                recency,
+                on_cooldown: state.on_cooldown(&format!("category:{name}"), now),
+            };
+            (c, utility::score(&cons))
+        })
+        .collect();
+    let raw: Vec<f64> = scored.iter().map(|(_, s)| *s).collect();
+    let idx = utility::softmax_choose(&raw, temperature, rng)?;
+    Some((scored, idx))
+}
+
+/// Build an OFFLINE goal for a domain: a real-world errand that emits nothing on
+/// the wire but still services (and later satisfies) the need.
+fn offline_goal(
+    policy: &PersonaPolicy,
+    domain: &Domain,
+    routine_name: &str,
+    hour: u8,
+) -> DecoyGoal {
+    let label = domain
+        .offline_label
+        .clone()
+        .unwrap_or_else(|| format!("attends to {}", domain.name));
+    DecoyGoal {
+        id: format!("{}:{}:{}:{}", policy.id, routine_name, domain.name, hour),
+        persona_id: policy.id.clone(),
+        routine: routine_name.to_string(),
+        need: domain.name.clone(),
+        online: false,
+        goal_type: domain
+            .goal_types
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "offline_errand".to_string()),
+        action_type: "offline".to_string(),
+        category: String::new(),
+        subcategory: Some(label.clone()),
+        budget: GoalBudget {
+            max_actions: 1,
+            max_minutes: policy.action_budget.max_minutes_per_run,
+        },
+        allowed_modules: policy.safety_policy.allowed_modules.clone(),
+        forbidden_capabilities: policy.safety_policy.forbidden_capabilities.clone(),
+        reason: format!(
+            "{} {label} (offline; nothing on the wire)",
+            policy.display_name
+        ),
+    }
+}
+
+/// Pick a goal-type label: prefer the domain's, else the routine's, else a default.
+fn pick_goal_type(domain: &Domain, routine: Option<&Routine>, rng: &mut impl RngExt) -> String {
+    if !domain.goal_types.is_empty() {
+        return domain.goal_types[rng.random_range(0..domain.goal_types.len())].clone();
+    }
+    match routine {
+        Some(r) if !r.goal_types.is_empty() => {
+            r.goal_types[rng.random_range(0..r.goal_types.len())].clone()
+        }
+        _ => "browse_topic".to_string(),
     }
 }
 
@@ -370,31 +475,59 @@ mod tests {
     }
 
     #[test]
-    fn evening_selects_an_allowed_category_goal() {
+    fn evening_yields_an_online_hobby_search() {
         let policy = elias();
         let kernel = BehaviorKernel;
         let mut state = BehaviorState::new("elias_rickensworth");
         let t = ts(4, 20);
         let tick = kernel.advance(&mut state, &policy, t);
-        // Seed chosen so the skip-day draw does not fire; try a few if needed.
-        for seed in 0..50u64 {
+        for seed in 0..80u64 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sel = GoalLayer.select(&policy, &state, &tick, t, &mut rng);
-            if let Some(goal) = sel.goal {
-                assert_eq!(goal.routine, "weekday_evening");
-                // The chosen category is one the policy allows.
-                assert!(policy.allowed_categories.contains(&goal.category));
-                // Evening favors CRAFTS/HISTORY/OUTDOOR_RECREATION.
-                assert!(
-                    ["CRAFTS", "HISTORY", "OUTDOOR_RECREATION"].contains(&goal.category.as_str())
-                );
-                assert_eq!(goal.action_type, "search");
-                assert!(goal.budget.max_actions >= 1);
-                assert!(!goal.reason.is_empty());
+            if let Some(goal) = GoalLayer.select(&policy, &state, &tick, t, &mut rng).goal {
+                if goal.online {
+                    assert_eq!(goal.routine, "weekday_evening");
+                    assert_eq!(goal.action_type, "search");
+                    assert!(policy.allowed_categories.contains(&goal.category));
+                    assert!(!goal.need.is_empty());
+                    assert!(!goal.reason.is_empty());
+                    return;
+                }
+            }
+        }
+        panic!("expected at least one online selection across seeds");
+    }
+
+    #[test]
+    fn both_online_and_offline_goals_occur() {
+        // Elias has online (hobby, upkeep) and offline (wellbeing, errands)
+        // domains, so across seeds the goal layer produces both kinds.
+        let policy = elias();
+        let kernel = BehaviorKernel;
+        let mut state = BehaviorState::new("elias_rickensworth");
+        let t = ts(2, 11); // Saturday late morning (the weekend routine)
+        let tick = kernel.advance(&mut state, &policy, t);
+        let mut saw_online = false;
+        let mut saw_offline = false;
+        for seed in 0..200u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            if let Some(goal) = GoalLayer.select(&policy, &state, &tick, t, &mut rng).goal {
+                if goal.online {
+                    saw_online = true;
+                    assert_eq!(goal.action_type, "search");
+                } else {
+                    saw_offline = true;
+                    assert_eq!(goal.action_type, "offline");
+                    assert!(goal.category.is_empty());
+                    assert!(!goal.need.is_empty());
+                }
+            }
+            if saw_online && saw_offline {
                 return;
             }
         }
-        panic!("expected at least one non-idle selection across seeds");
+        panic!(
+            "expected both online and offline goals (online={saw_online}, offline={saw_offline})"
+        );
     }
 
     #[test]
@@ -412,30 +545,28 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_category_is_penalized_out_of_selection() {
+    fn pick_category_avoids_cooldown() {
         let policy = elias();
-        let kernel = BehaviorKernel;
         let mut state = BehaviorState::new("elias_rickensworth");
         let t = ts(4, 20);
-        let tick = kernel.advance(&mut state, &policy, t);
-        // Put every evening category except CRAFTS is not possible; instead put
-        // CRAFTS and HISTORY on cooldown and confirm the survivor is chosen.
         state
             .cooldowns
             .insert("category:CRAFTS".to_string(), t + 10_000_000);
         state
             .cooldowns
             .insert("category:HISTORY".to_string(), t + 10_000_000);
+        let cats = vec![
+            CategoryPool::CRAFTS,
+            CategoryPool::HISTORY,
+            CategoryPool::OUTDOOR_RECREATION,
+        ];
         for seed in 0..50u64 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sel = GoalLayer.select(&policy, &state, &tick, t, &mut rng);
-            if let Some(goal) = sel.goal {
-                // A non-pivot pick must avoid the cooled categories; a pivot also
-                // prefers non-cooldown, so OUTDOOR_RECREATION is the expected pick.
-                assert_eq!(goal.category, "OUTDOOR_RECREATION");
-                return;
-            }
+            let Some((scored, idx)) = pick_category(&policy, &cats, &state, t, &mut rng, 0.4)
+            else {
+                panic!("a non-cooled category exists");
+            };
+            assert_eq!(scored[idx].0, CategoryPool::OUTDOOR_RECREATION);
         }
-        panic!("expected a non-idle selection");
     }
 }

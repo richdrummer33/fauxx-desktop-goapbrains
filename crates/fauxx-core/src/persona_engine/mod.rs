@@ -43,6 +43,7 @@ pub mod builtins;
 pub mod goal;
 pub mod kernel;
 pub mod log;
+pub mod needs;
 pub mod planner;
 pub mod policy;
 pub mod safety;
@@ -52,8 +53,9 @@ mod utility;
 pub use goal::{DecoyGoal, GoalLayer};
 pub use kernel::{BehaviorKernel, BehaviorState};
 pub use log::ActivityRecord;
+pub use needs::NeedState;
 pub use planner::{Intent, Planner};
-pub use policy::{PersonaPolicy, PolicyIssue, POLICY_SCHEMA_VERSION};
+pub use policy::{Domain, PersonaPolicy, PolicyIssue, POLICY_SCHEMA_VERSION};
 pub use safety::{SafetyDecision, SafetyGate};
 pub use sidecar::{DisabledAssistant, SemanticAssistant, SidecarConstraints};
 
@@ -248,6 +250,29 @@ pub fn make_activity_record(
     }
 }
 
+/// Build an OFFLINE decoy-activity record: the persona did something in the real
+/// world (no query, no domain, nothing on the wire).
+pub fn make_offline_record(policy: &PersonaPolicy, goal: &DecoyGoal, now: i64) -> ActivityRecord {
+    ActivityRecord {
+        timestamp: now,
+        persona_id: policy.id.clone(),
+        policy_version: policy.schema_version,
+        routine: Some(goal.routine.clone()),
+        goal: format!("{}:{}", goal.goal_type, goal.need),
+        action_type: "offline".to_string(),
+        category: String::new(),
+        query_seed: goal.subcategory.clone().unwrap_or_default(),
+        final_query: None,
+        target_domain: None,
+        dwell_seconds: None,
+        egress_mode: "offline".to_string(),
+        safety_outcome: "allowed".to_string(),
+        executor_result: "offline".to_string(),
+        error: None,
+        reason: goal.reason.clone(),
+    }
+}
+
 /// A deterministic UUIDv4-format id derived from the policy id via FNV-1a, so the
 /// materialized backing persona is stable across runs and cannot collide with a
 /// randomly-minted persona by construction.
@@ -304,8 +329,9 @@ mod tests {
     fn plan_tick_produces_a_budgeted_safe_plan_in_the_evening() {
         let policy = elias();
         let gate = SafetyGate::new();
-        // Search seeds until a non-idle (non-skip-day) evening tick is produced.
-        for seed in 0..100u64 {
+        // Search seeds until an ONLINE evening tick (a real search plan) appears;
+        // offline ticks (real-world errands) are valid but carry no intents.
+        for seed in 0..200u64 {
             let mut state = BehaviorState::new("elias_rickensworth");
             let report = plan_tick(
                 &policy,
@@ -315,7 +341,8 @@ mod tests {
                 ts(4, 20),
                 seed,
             );
-            if !report.idle {
+            let online = report.selected_goal.as_ref().is_some_and(|g| g.online);
+            if !report.idle && online {
                 assert!(report.selected_goal.is_some());
                 assert!(!report.candidate_intents.is_empty());
                 // The final plan respects the per-run action budget.

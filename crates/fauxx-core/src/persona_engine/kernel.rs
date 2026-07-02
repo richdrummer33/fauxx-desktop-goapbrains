@@ -75,6 +75,10 @@ pub struct BehaviorState {
     /// Cooldowns: key (e.g. `category:CRAFTS`, `engine:google`) -> epoch millis
     /// until which the key is on cooldown.
     pub cooldowns: BTreeMap<String, i64>,
+    /// Need/motive levels (the Sims-like decaying drives). Additive; defaults to
+    /// empty for state written before needs existed.
+    #[serde(default)]
+    pub needs: crate::persona_engine::needs::NeedState,
     /// Local-only persona diary summaries (bounded; decoy-only, no real data).
     pub memory_summaries: Vec<String>,
     /// Actions performed on `day_epoch` (for the soft daily budget).
@@ -98,6 +102,7 @@ impl BehaviorState {
             energy: 0.5,
             last_actions: Vec::new(),
             cooldowns: BTreeMap::new(),
+            needs: crate::persona_engine::needs::NeedState::default(),
             memory_summaries: Vec::new(),
             actions_today: 0,
             day_epoch: 0,
@@ -184,10 +189,14 @@ impl BehaviorKernel {
         now: i64,
     ) -> TickContext {
         let (is_weekend, hour) = day_and_hour(now);
+        let elapsed_hours = if state.last_updated > 0 && now > state.last_updated {
+            (now - state.last_updated) as f64 / 3_600_000.0
+        } else {
+            0.0
+        };
 
         // Decay topic momentum by the elapsed time since the last advance.
-        if state.last_updated > 0 && now > state.last_updated {
-            let elapsed_hours = (now - state.last_updated) as f64 / 3_600_000.0;
+        if elapsed_hours > 0.0 {
             let half_life = policy.topic_decay.half_life_hours.max(0.01);
             let factor = 0.5_f64.powf(elapsed_hours / half_life);
             for score in state.topic_scores.values_mut() {
@@ -195,6 +204,16 @@ impl BehaviorKernel {
             }
             // Drop scores that have decayed to noise so the map stays small.
             state.topic_scores.retain(|_, v| *v >= 0.01);
+        }
+
+        // Needs deplete over time: seed any declared need, then drain each by its
+        // domain's rate. The most-deficient needs pull behavior in the goal layer.
+        let domains = policy.effective_domains();
+        state.needs.ensure(domains.iter().map(|d| d.name.clone()));
+        for domain in &domains {
+            state
+                .needs
+                .deplete(&domain.name, domain.decay_per_hour, elapsed_hours);
         }
 
         // Prune expired cooldowns.
@@ -387,6 +406,21 @@ mod tests {
         kernel.advance(&mut state, &policy, ts(4, 20));
         let evening = state.energy;
         assert!(evening > night);
+    }
+
+    #[test]
+    fn needs_are_seeded_and_deplete_over_time() {
+        let policy = elias();
+        let kernel = BehaviorKernel;
+        let mut state = BehaviorState::new("elias_rickensworth");
+        kernel.advance(&mut state, &policy, ts(4, 6));
+        // Every declared domain's need is seeded.
+        assert!(state.needs.levels.contains_key("hobby"));
+        assert!(state.needs.levels.contains_key("wellbeing"));
+        let start = state.needs.level("hobby");
+        // Ten hours later the hobby need has drained (no action satisfied it).
+        kernel.advance(&mut state, &policy, ts(4, 16));
+        assert!(state.needs.level("hobby") < start);
     }
 
     #[test]

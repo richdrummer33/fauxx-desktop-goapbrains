@@ -154,6 +154,47 @@ dwell_seconds_min = 25
 dwell_seconds_max = 90
 max_results_to_visit = 1
 
+# --- Life domains (needs/motives) ---
+# Elias is a person, not just a hobby. Each domain serves a need. Some are mostly
+# ONLINE (he searches); some are OFFLINE (he does it in the real world and emits
+# nothing on the wire). Notably, his wellbeing is handled offline, so a decoy
+# never emits health/medical query signal on his behalf.
+
+[[domains]]
+name = "hobby"
+categories = ["HISTORY", "CRAFTS", "OUTDOOR_RECREATION", "SCIENCE"]
+online_bias = 0.95
+decay_per_hour = 0.08
+satisfy_amount = 0.45
+goal_types = ["continue_hobby_thread", "browse_hobby"]
+
+[[domains]]
+name = "upkeep"
+categories = ["HOME_IMPROVEMENT"]
+online_bias = 0.55
+decay_per_hour = 0.05
+satisfy_amount = 0.4
+offline_label = "potters about in the shed"
+goal_types = ["household_task", "tool_maintenance"]
+
+[[domains]]
+name = "wellbeing"
+categories = []
+online_bias = 0.0
+decay_per_hour = 0.05
+satisfy_amount = 0.5
+offline_label = "goes for a walk and puts the kettle on"
+goal_types = ["rest"]
+
+[[domains]]
+name = "errands"
+categories = []
+online_bias = 0.1
+decay_per_hour = 0.05
+satisfy_amount = 0.4
+offline_label = "walks to the chemist and the post office"
+goal_types = ["errand"]
+
 # --- Routines ---
 
 [[routines]]

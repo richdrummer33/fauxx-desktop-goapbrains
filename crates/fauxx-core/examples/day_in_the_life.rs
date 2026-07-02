@@ -91,6 +91,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             };
 
+            // OFFLINE action: he attends to a need in the real world. Nothing on
+            // the wire. The harness plays the executor and satisfies the need.
+            if let Some(goal) = report.selected_goal.as_ref().filter(|g| !g.online) {
+                let amount = policy
+                    .domain_by_need(&goal.need)
+                    .map(|d| d.satisfy_amount)
+                    .unwrap_or(0.4);
+                state.needs.satisfy(&goal.need, amount);
+                let label = goal
+                    .subcategory
+                    .clone()
+                    .unwrap_or_else(|| goal.need.clone());
+                println!("{hour:02}:00  {energy}  {routine:<16} [offline] {label}");
+                did_something = true;
+                continue;
+            }
+
             // An active window but the goal layer chose to skip (anti-coherence).
             if report.idle || report.final_plan.is_empty() {
                 println!("{hour:02}:00  {energy}  {routine:<16} (idle: nothing catches his eye)");
@@ -108,7 +125,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
 
-            // "Execute": record each approved action so momentum + cooldowns evolve.
+            // ONLINE action: record each approved query so momentum + cooldowns
+            // evolve, and satisfy the serviced need.
             let goal = match &report.selected_goal {
                 Some(g) => g,
                 None => continue,
@@ -121,6 +139,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             for intent in &report.final_plan {
                 state.record_action(&intent.category, &intent.query_seed, now);
             }
+            let amount = policy
+                .domain_by_need(&goal.need)
+                .map(|d| d.satisfy_amount)
+                .unwrap_or(0.4);
+            let need = goal.need.clone();
             let topic = goal
                 .subcategory
                 .as_deref()
@@ -130,6 +153,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 goal.category,
                 queries.join(", ")
             );
+            state.needs.satisfy(&need, amount);
             did_something = true;
         }
 
@@ -146,6 +170,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             .collect();
         if !top.is_empty() {
             println!("   lingering interests: {}", top.join("  "));
+        }
+        let needs: Vec<String> = state
+            .needs
+            .levels
+            .iter()
+            .map(|(k, v)| format!("{k}={v:.2}"))
+            .collect();
+        if !needs.is_empty() {
+            println!("   needs (1.0=content): {}", needs.join("  "));
         }
         println!();
     }

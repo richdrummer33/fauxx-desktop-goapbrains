@@ -96,6 +96,33 @@ persona's interests (fountain pen ink, then blotting paper, then nib grinding)
 rather than repeating one. Every candidate, from any source, still passes the
 harmful-query blocklist and the Safety Gate.
 
+## Needs, domains, and a life beyond hobbies
+
+A persona is a person, not just a hobby. The engine models a small vector of
+decaying needs/motives (`persona_engine::needs`), the same idea The Sims uses:
+time depletes each need, actions satisfy it, and the goal layer services
+whichever need is most deficient (weighted, not greedy).
+
+Each need is declared by a `domain` in the policy. A domain says which need it
+serves and HOW:
+
+- an ONLINE domain (categories plus a high `online_bias`) is satisfied by decoy
+  searches (Elias's `hobby` and `upkeep`),
+- an OFFLINE domain (no categories, or a low `online_bias`) is satisfied in the
+  real world and emits NOTHING on the wire (Elias's `wellbeing` and `errands`:
+  he goes for a walk, potters in the shed, walks to the chemist).
+
+Selection is desire then goal then action: the deficit picks a domain (a
+DESIRE), the utility model picks a category within it (a GOAL), and the planner
+produces the query (the ACTION). This is deliberately GOAP-adjacent without the
+A* machinery, so richer multi-step planning can slot in later.
+
+Offline domains are also a safety feature, not just realism: a sensitive
+real-life need (health) is modeled as offline, so the decoy never emits medical
+or other self-signalling queries on the persona's behalf. Domains are additive;
+a policy that declares none behaves exactly as before (one synthesized online
+`hobby` domain).
+
 ## The two identity models
 
 `SyntheticPersona` is the frozen cross-device wire contract shared with the phone

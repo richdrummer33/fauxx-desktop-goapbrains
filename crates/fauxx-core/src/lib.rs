@@ -3310,6 +3310,30 @@ impl Core {
             }
         }
 
+        // Offline goal: the persona attends to a need in the real world. Satisfy
+        // the need, log an offline record, persist. No browser, no network.
+        if let Some(goal) = report.selected_goal.as_ref().filter(|g| !g.online) {
+            let amount = policy
+                .domain_by_need(&goal.need)
+                .map(|d| d.satisfy_amount)
+                .unwrap_or(0.4);
+            state.needs.satisfy(&goal.need, amount);
+            activity.push(persona_engine::make_offline_record(policy, goal, now));
+            let rejected = activity.len().saturating_sub(1);
+            let guard = store.lock().await;
+            guard.upsert_persona_engine_state(&state)?;
+            for rec in &activity {
+                guard.append_persona_engine_activity(rec)?;
+            }
+            return Ok(PersonaEngineRunOutcome {
+                report,
+                executed: false,
+                dispatched: 0,
+                skipped: rejected,
+                activity,
+            });
+        }
+
         // Idle or nothing approved: persist the advanced state + rejection log.
         if report.idle || report.final_plan.is_empty() {
             let guard = store.lock().await;
@@ -3326,6 +3350,12 @@ impl Core {
                 activity,
             });
         }
+
+        let goal_need = report
+            .selected_goal
+            .as_ref()
+            .map(|g| g.need.clone())
+            .unwrap_or_default();
 
         // Materialize + persist the backing persona (once) so the existing
         // browser/egress path can drive it.
@@ -3396,6 +3426,14 @@ impl Core {
                 ));
                 skipped += 1;
             }
+        }
+        // A dispatched session replenishes the serviced need.
+        if dispatched > 0 && !goal_need.is_empty() {
+            let amount = policy
+                .domain_by_need(&goal_need)
+                .map(|d| d.satisfy_amount)
+                .unwrap_or(0.4);
+            state.needs.satisfy(&goal_need, amount);
         }
         state.add_memory_summary(format!(
             "{}: {dispatched} decoy searches ({skipped} skipped) during {}",
