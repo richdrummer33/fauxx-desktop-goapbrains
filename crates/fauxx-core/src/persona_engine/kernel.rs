@@ -57,6 +57,11 @@ pub struct BehaviorState {
     pub current_routine: Option<String>,
     /// Recently-touched topics/categories (most recent last, bounded).
     pub recent_topics: Vec<String>,
+    /// Recently-used topic seeds (the persona's own subtopics, most recent last,
+    /// bounded). Lets the goal layer walk THROUGH a persona's interests over days
+    /// (fountain pens today, blotting paper tomorrow) instead of repeating one.
+    #[serde(default)]
+    pub recent_seeds: Vec<String>,
     /// Per-category momentum score (decays over time; higher = hotter).
     pub topic_scores: BTreeMap<String, f64>,
     /// Curiosity drive in `[0, 1]` (appetite for a new topic).
@@ -86,6 +91,7 @@ impl BehaviorState {
             last_updated: 0,
             current_routine: None,
             recent_topics: Vec::new(),
+            recent_seeds: Vec::new(),
             topic_scores: BTreeMap::new(),
             curiosity: 0.5,
             boredom: 0.0,
@@ -108,10 +114,11 @@ impl BehaviorState {
         self.cooldowns.get(key).is_some_and(|&until| until > now)
     }
 
-    /// Record that the persona acted on `category_name` at `now`: bump its
-    /// momentum, push history, set a category cooldown, and count it toward the
-    /// daily budget. Called by the executor after a dispatched action.
-    pub fn record_action(&mut self, category_name: &str, descriptor: &str, now: i64) {
+    /// Record that the persona acted on `category_name` (pursuing topic `seed`)
+    /// at `now`: bump the category's momentum, push history (category + seed),
+    /// set a category cooldown, and count it toward the daily budget. Called by
+    /// the executor after a dispatched action.
+    pub fn record_action(&mut self, category_name: &str, seed: &str, now: i64) {
         *self
             .topic_scores
             .entry(category_name.to_string())
@@ -121,9 +128,12 @@ impl BehaviorState {
             category_name.to_string(),
             HISTORY_LIMIT,
         );
+        if !seed.is_empty() {
+            push_bounded(&mut self.recent_seeds, seed.to_string(), HISTORY_LIMIT);
+        }
         push_bounded(
             &mut self.last_actions,
-            descriptor.to_string(),
+            format!("{category_name}:{seed}"),
             HISTORY_LIMIT,
         );
         self.cooldowns.insert(
@@ -339,7 +349,7 @@ mod tests {
         let kernel = BehaviorKernel;
         let mut state = BehaviorState::new("elias_rickensworth");
         kernel.advance(&mut state, &policy, ts(4, 18));
-        state.record_action("CRAFTS", "search:fountain pens", ts(4, 18));
+        state.record_action("CRAFTS", "fountain pens", ts(4, 18));
         let hot = state.topic_score("CRAFTS");
         assert!(hot > 0.0);
         // Advance ~2 half-lives (72h) later: momentum should be ~1/4.
@@ -359,7 +369,7 @@ mod tests {
         let mut state = BehaviorState::new("elias_rickensworth");
         let t = ts(4, 18);
         kernel.advance(&mut state, &policy, t);
-        state.record_action("CRAFTS", "search:pens", t);
+        state.record_action("CRAFTS", "pens", t);
         assert!(state.on_cooldown("category:CRAFTS", t));
         // After the cooldown window, a later advance prunes it.
         let later = t + CATEGORY_COOLDOWN_MS + 1;
@@ -386,7 +396,7 @@ mod tests {
         let mut state = BehaviorState::new("elias_rickensworth");
         let t = ts(4, 18);
         kernel.advance(&mut state, &policy, t);
-        state.record_action("CRAFTS", "search:pens", t);
+        state.record_action("CRAFTS", "pens", t);
         assert_eq!(state.actions_today, 1);
         // Next day, the kernel resets the counter.
         kernel.advance(&mut state, &policy, ts(5, 18));

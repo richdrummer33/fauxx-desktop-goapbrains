@@ -52,7 +52,9 @@ fn day_name(day_index: i64) -> &'static str {
 
 /// A tiny single-char energy meter.
 fn energy_bar(e: f64) -> char {
-    let bars = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+    let bars = [
+        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
+    ];
     let idx = ((e * (bars.len() as f64 - 1.0)).round() as usize).min(bars.len() - 1);
     bars[idx]
 }
@@ -91,9 +93,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             // An active window but the goal layer chose to skip (anti-coherence).
             if report.idle || report.final_plan.is_empty() {
-                println!(
-                    "{hour:02}:00  {energy}  {routine:<16} (idle: nothing catches his eye)"
-                );
+                println!("{hour:02}:00  {energy}  {routine:<16} (idle: nothing catches his eye)");
                 continue;
             }
 
@@ -119,9 +119,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .map(|i| format!("\"{}\"", i.final_query))
                 .collect();
             for intent in &report.final_plan {
-                state.record_action(&intent.category, &intent.final_query, now);
+                state.record_action(&intent.category, &intent.query_seed, now);
             }
-            let topic = goal.subcategory.as_deref().unwrap_or(goal.category.as_str());
+            let topic = goal
+                .subcategory
+                .as_deref()
+                .unwrap_or(goal.category.as_str());
             println!(
                 "{hour:02}:00  {energy}  {routine:<16} {}/{topic}  ->  {}",
                 goal.category,

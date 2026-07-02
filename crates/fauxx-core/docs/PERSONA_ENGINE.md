@@ -27,14 +27,12 @@ Persona Policy -> Behavior Kernel -> Goal Layer -> Planner
   boredom, per-topic momentum with exponential decay, cooldowns). Pure and
   deterministic given the wall-clock time.
 - Goal Layer (`persona_engine::goal`): the control plane. It scores the routine's
-  candidate categories (momentum plus a curiosity-scaled novelty bonus minus a
-  cooldown penalty) and chooses ONE goal: routine, goal type, action type,
+  candidate categories with the utility model (see below) and draws ONE with a
+  temperature softmax, then fills in a goal: routine, goal type, action type,
   category, subcategory, budget, allowed modules, and a boring human reason.
-  Occasionally it takes a boring pivot or skips the run entirely so the persona
-  is not too coherent (coherence is itself a fingerprint).
 - Planner (`persona_engine::planner`): turns the goal into structured candidate
   intents carrying the actual search query. Rules-first and deterministic; it
-  never emits an arbitrary URL.
+  never emits an arbitrary URL, and it keeps the persona IN CHARACTER (see below).
 - LLM Sidecar (`persona_engine::sidecar`): an optional helper. See limits below.
 - Safety Gate (`persona_engine::safety`): mandatory, deterministic, fail-closed
   enforcement. Every intent must pass before it can execute.
@@ -60,6 +58,43 @@ the frozen cross-device persona wire model. His routines cover a weekday morning
 (weather and tea), midday (household and tools), evening (hobby browsing), and a
 longer weekend session. Topic decay, occasional pivots, and skipped days keep him
 from being perfectly predictable.
+
+## Decision model (utility AI)
+
+The goal layer is a small utility-AI selector, the same family of technique The
+Sims uses (`persona_engine::utility`). Each candidate category is scored from a
+handful of considerations, each normalized to zero-to-one:
+
+- affinity: how core the category is to the persona, derived from how many
+  routines favor it (a signature interest scores higher than an incidental one),
+- momentum: continuing a warm thread the persona has been enjoying,
+- novelty: a curiosity-scaled appetite for a cold topic,
+- satiation: a penalty for having done this category a lot recently,
+- cooldown: a near-hard gate right after acting on a category.
+
+These are combined MULTIPLICATIVELY (a category is attractive only when all of
+its considerations are decent, per Dave Mark's utility-AI "Behavioral
+Mathematics"), and the winner is drawn with a temperature-weighted softmax rather
+than a hard argmax. Variety, boring pivots, and mild contradictions therefore
+EMERGE from the sampling instead of being bolted on with a coin flip. A higher
+temperature (nudged up by the policy's `pivot_probability`) makes the persona
+more restless. Skipping a whole run (an idle day) stays a separate draw.
+
+## In-character queries and interest threading
+
+The persona picks the category AND a topic seed; the queries should sound like
+the persona, not like the broad category corpus. The planner builds candidates in
+order: (1) the chosen seed in the persona's own words, (2) on-topic refinements of
+it, (3) the persona's OTHER curated seeds for that category, and only (4) a light
+top-up from the generic query bank if the persona is seed-poor. So Elias searches
+"antique barometers" and "how to read a falling barometer", not whatever a generic
+history corpus happens to contain.
+
+Interest threading: the goal layer prefers a seed the persona has NOT used
+recently (tracked in `recent_seeds`), so consecutive sessions walk through the
+persona's interests (fountain pen ink, then blotting paper, then nib grinding)
+rather than repeating one. Every candidate, from any source, still passes the
+harmful-query blocklist and the Safety Gate.
 
 ## The two identity models
 

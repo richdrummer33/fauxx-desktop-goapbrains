@@ -3363,11 +3363,7 @@ impl Core {
                 .iter()
                 .find(|d| d.query == intent.final_query);
             if let Some(d) = hit {
-                state.record_action(
-                    &intent.category,
-                    &format!("{}:{}", intent.action_type, intent.final_query),
-                    now,
-                );
+                state.record_action(&intent.category, &intent.query_seed, now);
                 activity.push(persona_engine::make_activity_record(
                     policy,
                     report.current_routine.clone(),

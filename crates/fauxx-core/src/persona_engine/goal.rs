@@ -33,9 +33,12 @@
 use rand::RngExt;
 use serde::Serialize;
 
+use std::collections::HashMap;
+
 use crate::persona::CategoryPool;
 use crate::persona_engine::kernel::{BehaviorState, TickContext};
 use crate::persona_engine::policy::PersonaPolicy;
+use crate::persona_engine::utility;
 
 /// A concrete goal chosen by the goal layer for one tick.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -87,12 +90,9 @@ pub struct GoalSelection {
     pub note: String,
 }
 
-/// Weight on continuing an existing topic thread (momentum).
-const MOMENTUM_WEIGHT: f64 = 1.0;
-/// Weight on the novelty bonus (scaled by curiosity).
-const NOVELTY_WEIGHT: f64 = 0.6;
-/// Penalty applied to a category currently on cooldown.
-const COOLDOWN_PENALTY: f64 = 5.0;
+/// Base softmax temperature for category selection. The policy's
+/// `pivot_probability` nudges it up, so a more restless persona explores more.
+const BASE_TEMPERATURE: f64 = 0.25;
 
 /// The goal layer. Stateless; reads the policy + state and chooses a goal.
 #[derive(Debug, Clone, Copy, Default)]
@@ -156,59 +156,59 @@ impl GoalLayer {
             };
         }
 
-        // Score each candidate.
+        // Score each candidate with the utility model (Sims-like considerations:
+        // affinity, momentum, novelty, satiation, cooldown), then draw the winner
+        // with a temperature softmax so variety and boring pivots EMERGE from the
+        // sampling rather than a separate coin flip.
         let max_momentum = candidates
             .iter()
             .map(|c| state.topic_score(c.as_name()))
             .fold(0.0_f64, f64::max)
             .max(1.0);
-        let mut scores: Vec<(CategoryPool, f64)> = candidates
+        let affinity = routine_affinity(policy);
+        let recent_len = state.recent_topics.len().max(1) as f64;
+        let scored: Vec<(CategoryPool, f64)> = candidates
             .iter()
             .map(|&c| {
-                let momentum = state.topic_score(c.as_name());
-                let novelty = (1.0 - momentum / max_momentum).clamp(0.0, 1.0) * state.curiosity;
-                let cooldown = if state.on_cooldown(&format!("category:{}", c.as_name()), now) {
-                    COOLDOWN_PENALTY
-                } else {
-                    0.0
+                let name = c.as_name();
+                let momentum = state.topic_score(name) / max_momentum;
+                let novelty = (1.0 - momentum).clamp(0.0, 1.0) * state.curiosity;
+                let recency = state
+                    .recent_topics
+                    .iter()
+                    .filter(|t| t.as_str() == name)
+                    .count() as f64
+                    / recent_len;
+                let cons = utility::Considerations {
+                    affinity: affinity.get(name).copied().unwrap_or(0.5),
+                    momentum,
+                    novelty,
+                    recency,
+                    on_cooldown: state.on_cooldown(&format!("category:{name}"), now),
                 };
-                let score = MOMENTUM_WEIGHT * momentum + NOVELTY_WEIGHT * novelty - cooldown;
-                (c, score)
+                (c, utility::score(&cons))
             })
             .collect();
 
-        // A boring pivot: with some probability pick the LOWEST (non-cooldown)
-        // scorer instead of the highest. Models "boring pivots, mild
-        // contradictions" so the persona is not perfectly coherent.
-        let pivot = rng.random::<f64>() < policy.topic_decay.pivot_probability;
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let chosen_category = if pivot {
-            // Lowest scorer that is not on cooldown, else the top one.
-            scores
-                .iter()
-                .rev()
-                .find(|(c, _)| !state.on_cooldown(&format!("category:{}", c.as_name()), now))
-                .or_else(|| scores.first())
-                .map(|(c, _)| *c)
-        } else {
-            scores.first().map(|(c, _)| *c)
-        };
-        let Some(category) = chosen_category else {
+        let raw_scores: Vec<f64> = scored.iter().map(|(_, s)| *s).collect();
+        let temperature = BASE_TEMPERATURE + policy.topic_decay.pivot_probability;
+        let Some(chosen_idx) = utility::softmax_choose(&raw_scores, temperature, rng) else {
             return GoalSelection {
                 goal: None,
-                scores: score_labels(&scores),
+                scores: score_labels(&scored),
                 idle: true,
                 note: "every candidate category is on cooldown".to_string(),
             };
         };
+        let category = scored[chosen_idx].0;
+        // A "pivot" is just when the sampler did not land on the top-scoring
+        // option; used only to flavor the human-readable reason.
+        let pivot = utility::argmax(&raw_scores) != Some(chosen_idx);
 
-        // Subcategory: a topic seed for the chosen category (rng pick).
-        let seeds = policy.topic_seeds_for(category);
-        let subcategory = if seeds.is_empty() {
-            None
-        } else {
-            Some(seeds[rng.random_range(0..seeds.len())].clone())
-        };
+        // Subcategory: walk THROUGH the persona's seeds for this category,
+        // preferring one not used recently (interest threading), so consecutive
+        // sessions progress (ink -> blotting paper) instead of repeating one.
+        let subcategory = choose_seed(policy, category, state, rng);
 
         // Goal type from the routine (rng pick), or a sensible default.
         let goal_type = match routine {
@@ -251,11 +251,59 @@ impl GoalLayer {
 
         GoalSelection {
             goal: Some(goal),
-            scores: score_labels(&scores),
+            scores: score_labels(&scored),
             idle: false,
             note: "goal selected".to_string(),
         }
     }
+}
+
+/// Per-category affinity in `[0.4, 1.0]`, from how many routines favor a category
+/// (a proxy for how CORE it is to the persona): a category named by every routine
+/// scores 1.0, a one-routine category floors at 0.4. Keyed by category name.
+fn routine_affinity(policy: &PersonaPolicy) -> HashMap<String, f64> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for c in policy.allowed_category_pool() {
+        let name = c.as_name().to_string();
+        let n = policy
+            .routines
+            .iter()
+            .filter(|r| r.categories.iter().any(|rc| rc == &name))
+            .count();
+        counts.insert(name, n);
+    }
+    let max = counts.values().copied().max().unwrap_or(0).max(1) as f64;
+    counts
+        .into_iter()
+        .map(|(name, n)| (name, 0.4 + 0.6 * (n as f64 / max)))
+        .collect()
+}
+
+/// Choose a topic seed for `category`, threading through the persona's interests:
+/// prefer a seed not in the recent-seed history (so sessions progress), falling
+/// back to the full seed set when they have all been used lately. `None` when the
+/// category declares no seeds.
+fn choose_seed(
+    policy: &PersonaPolicy,
+    category: CategoryPool,
+    state: &BehaviorState,
+    rng: &mut impl RngExt,
+) -> Option<String> {
+    let seeds = policy.topic_seeds_for(category);
+    if seeds.is_empty() {
+        return None;
+    }
+    let fresh: Vec<&String> = seeds
+        .iter()
+        .filter(|s| !state.recent_seeds.contains(s))
+        .collect();
+    let pool: Vec<&String> = if fresh.is_empty() {
+        seeds.iter().collect()
+    } else {
+        fresh
+    };
+    let pick = pool[rng.random_range(0..pool.len())];
+    Some(pick.clone())
 }
 
 /// Convert scored categories to `(name, score)` label pairs for the report.

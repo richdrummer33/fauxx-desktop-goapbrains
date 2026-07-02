@@ -47,6 +47,7 @@ pub mod planner;
 pub mod policy;
 pub mod safety;
 pub mod sidecar;
+mod utility;
 
 pub use goal::{DecoyGoal, GoalLayer};
 pub use kernel::{BehaviorKernel, BehaviorState};

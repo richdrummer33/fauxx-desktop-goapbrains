@@ -31,7 +31,7 @@
 //! the Safety Gate before it can execute.
 
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{RngExt, SeedableRng};
 use serde::Serialize;
 
 use crate::persona::CategoryPool;
@@ -172,8 +172,15 @@ impl Planner {
         }
     }
 
-    /// Deterministic fallback candidates: the approved seed (if safe) followed by
-    /// [`QueryGenerator`] draws for the category, deduped and blocklist-safe.
+    /// Deterministic fallback candidates, kept IN CHARACTER.
+    ///
+    /// The persona picked the category and a topic seed; the queries should sound
+    /// like the persona, not like the broad category corpus. So the order is:
+    /// (1) the chosen seed itself, (2) on-topic refinements of it (its own words
+    /// plus qualifiers, via [`QueryGenerator::refine_goal`]), (3) the persona's
+    /// OTHER curated seeds for this category, and only (4) a light top-up from the
+    /// generic [`QueryGenerator`] bank if the persona has too few seeds to fill
+    /// the plan. Every candidate is deduped and blocklist-safe.
     fn deterministic_candidates(
         &self,
         policy: &PersonaPolicy,
@@ -184,26 +191,68 @@ impl Planner {
         max: usize,
     ) -> Vec<String> {
         let generator = QueryGenerator::new(seed);
-        let lean = commercial_lean(&policy.backing_persona_categories());
         let mut rng = StdRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15);
-
         let mut out: Vec<String> = Vec::new();
-        // The curated seed itself is a plausible query if it clears the blocklist.
-        let trimmed = query_seed.trim();
-        if !trimmed.is_empty() && !blocklist.is_blocked(trimmed) {
-            out.push(trimmed.to_string());
+
+        let add = |out: &mut Vec<String>, q: &str| {
+            let q = q.trim();
+            if !q.is_empty() && out.iter().all(|e| e != q) && !blocklist.is_blocked(q) {
+                out.push(q.to_string());
+            }
+        };
+
+        // (1) The chosen seed, in the persona's own words.
+        add(&mut out, query_seed);
+
+        // (2) On-topic refinements of the seed (stays on the seed's words).
+        if out.len() < max {
+            for r in generator.refine_goal(query_seed, max, &mut rng) {
+                if out.len() >= max {
+                    break;
+                }
+                add(&mut out, &r);
+            }
         }
-        // Fill the rest with generator draws (already blocklist-gated internally).
+
+        // (3) The persona's OTHER seeds for this category, shuffled, plus a
+        //     refinement of each if we still have room.
+        let mut others: Vec<String> = policy
+            .topic_seeds_for(category)
+            .iter()
+            .filter(|s| s.as_str() != query_seed)
+            .cloned()
+            .collect();
+        shuffle(&mut others, &mut rng);
+        for other in &others {
+            if out.len() >= max {
+                break;
+            }
+            add(&mut out, other);
+            if out.len() < max {
+                if let Some(r) = generator.refine_goal(other, 1, &mut rng).into_iter().next() {
+                    add(&mut out, &r);
+                }
+            }
+        }
+
+        // (4) Only if the persona is seed-poor, top up from the generic bank.
+        let lean = commercial_lean(&policy.backing_persona_categories());
         let mut attempts = 0;
         while out.len() < max && attempts < max * 6 {
             attempts += 1;
             if let Some(q) = generator.generate(category, lean, &mut rng) {
-                if !out.contains(&q) && !blocklist.is_blocked(&q) {
-                    out.push(q);
-                }
+                add(&mut out, &q);
             }
         }
         out
+    }
+}
+
+/// In-place Fisher-Yates shuffle using the injected RNG (deterministic per seed).
+fn shuffle(items: &mut [String], rng: &mut impl RngExt) {
+    for i in (1..items.len()).rev() {
+        let j = rng.random_range(0..=i);
+        items.swap(i, j);
     }
 }
 
