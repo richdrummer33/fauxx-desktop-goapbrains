@@ -87,6 +87,39 @@ Run `fauxx-cli --help` (and `fauxx-cli <command> --help`) for the full surface, 
 
 To run the GUI, build with the `gui` feature and run `fauxx-desktop` (a graphical session is required). The system tray uses the StatusNotifierItem spec on Linux and the native tray on Windows and macOS.
 
+## Persona engine (Elias mode)
+
+The persona engine is a small, safety-constrained decoy behavior simulation:
+"The Sims for privacy decoy personas". A deterministic control layer drives a
+persona's boring daily browsing (a Policy, a Sims-like Behavior Kernel, a Goal
+Layer, a Planner, a Safety Gate, and the existing isolated Chromium executor),
+and an optional LLM sidecar is a narrow helper that is disabled by default (no
+model ships in this version). It is not an autonomous LLM browser agent.
+
+The first built-in persona is Elias Rickensworth, a fictional, harmless,
+oddly specific hobbyist (Victorian railway lamps, fountain pens, blue black ink,
+rainwater barrels, antique barometers, garden railways). Every action is bounded
+and safety-gated: no logins, no forms, no accounts, no purchases, no arbitrary
+URLs.
+
+```sh
+fauxx-cli persona-engine list
+fauxx-cli persona-engine show elias_rickensworth
+fauxx-cli persona-engine validate elias_rickensworth
+fauxx-cli persona-engine plan --persona elias_rickensworth --dry-run
+fauxx-cli persona-engine run-once --persona elias_rickensworth        # drives Chromium
+fauxx-cli persona-engine logs export --persona elias_rickensworth --format jsonl
+```
+
+`plan` (and `run-once --dry-run`) show the full decision (routine, behavior state,
+goal scores, candidate intents, safety verdict, final plan) and perform no network
+call. The design, limits, and a worked dry-run example are in
+[`crates/fauxx-core/docs/PERSONA_ENGINE.md`](./crates/fauxx-core/docs/PERSONA_ENGINE.md).
+
+This dilutes weak probabilistic behavioral profiling with bounded decoy signals.
+It does not defeat logged-in account tracking, payment or phone identity,
+deterministic first-party telemetry, or legal identification.
+
 ## Cross-device sync
 
 Pair the desktop with the phone over the local network: one device shows a QR payload carrying its public key and a connection hint, the other scans (or pastes) it. After pairing, personas and signed artifacts move over a sealed channel that unpaired devices cannot read or write. The wire contract and security model live in the `crate::sync::wire` and `crate::sync` modules.

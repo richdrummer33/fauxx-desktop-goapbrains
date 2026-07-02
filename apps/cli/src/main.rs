@@ -124,6 +124,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
         Command::Egress { command } => commands::egress::run(config, command).await,
         Command::Dns { command } => commands::dns::run(config, command).await,
         Command::Campaign { command } => commands::campaign::run(config, command).await,
+        Command::PersonaEngine { command } => commands::persona_engine::run(config, command).await,
         Command::Logs { command } => commands::logs::run(config, command).await,
         Command::NativeHost => commands::native_host::run(config).await,
         // Handled above (resolves its own config); unreachable here.
