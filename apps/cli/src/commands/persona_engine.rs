@@ -330,6 +330,10 @@ fn print_report(report: &DryRunReport) {
             );
         }
     }
+    println!(
+        "next_action_in:  ~{} min (jittered cadence)",
+        report.suggested_next_delay_seconds / 60
+    );
     println!("no_network:      {}", report.no_network);
 }
 

@@ -125,6 +125,9 @@ pub struct DryRunReport {
     pub safety_decisions: Vec<SafetyDecision>,
     /// The final, safety-approved action plan (the intents that would execute).
     pub final_plan: Vec<Intent>,
+    /// A jittered suggestion for how long (seconds) until the persona's next
+    /// action, so a driver can schedule non-metronomic cadence.
+    pub suggested_next_delay_seconds: u64,
     /// Always `true` for a dry-run: no network call was performed.
     pub no_network: bool,
 }
@@ -161,6 +164,8 @@ pub fn plan_tick(
     let tick = kernel.advance(state, policy, now);
     let mut rng = StdRng::seed_from_u64(seed);
     let selection = GoalLayer.select(policy, state, &tick, now, &mut rng);
+    // Jittered inter-arrival so a driver never schedules a metronomic cadence.
+    let next_delay = kernel::next_delay_seconds(state.energy, &mut rng);
 
     let mut report = DryRunReport {
         persona_id: policy.id.clone(),
@@ -174,6 +179,7 @@ pub fn plan_tick(
         sidecar_used: false,
         safety_decisions: Vec::new(),
         final_plan: Vec::new(),
+        suggested_next_delay_seconds: next_delay,
         no_network: true,
     };
 

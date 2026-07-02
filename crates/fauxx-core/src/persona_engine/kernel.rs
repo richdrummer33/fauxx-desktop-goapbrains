@@ -32,6 +32,7 @@
 
 use std::collections::BTreeMap;
 
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 use crate::persona_engine::policy::PersonaPolicy;
@@ -288,6 +289,21 @@ fn circadian_energy(hour: u8) -> f64 {
     }
 }
 
+/// A jittered inter-arrival delay (seconds) until the persona's NEXT action, so
+/// the cadence is never metronomic (a regular clock tick is itself a
+/// fingerprint). Higher energy shortens the mean gap (a livelier persona acts
+/// more often); the gap is then drawn from an exponential (Poisson-like)
+/// distribution via `-ln(1 - u)`, mirroring the household scheduler's model, and
+/// clamped to a sane band. Deterministic given `rng`.
+pub fn next_delay_seconds(energy: f64, rng: &mut impl RngExt) -> u64 {
+    // Mean gap: ~15 min at full energy, ~75 min when flat.
+    let e = energy.clamp(0.0, 1.0);
+    let mean_secs = 4500.0 - 3600.0 * e;
+    let u = rng.random::<f64>().clamp(1e-9, 1.0 - 1e-9);
+    let sample = -(1.0 - u).ln() * mean_secs;
+    sample.clamp(60.0, 4.0 * 3600.0) as u64
+}
+
 /// The UTC day index for `now` (millis since the epoch, floored to days). Clamps
 /// a pre-epoch timestamp to day 0.
 fn day_index(now: i64) -> i64 {
@@ -406,6 +422,28 @@ mod tests {
         kernel.advance(&mut state, &policy, ts(4, 20));
         let evening = state.energy;
         assert!(evening > night);
+    }
+
+    #[test]
+    fn next_delay_is_bounded_and_shortens_with_energy() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+        let mut rng = StdRng::seed_from_u64(1);
+        let d = next_delay_seconds(0.9, &mut rng);
+        assert!((60..=4 * 3600).contains(&d), "delay out of band: {d}");
+        // Averaged over many draws, high energy gives a shorter mean gap.
+        let mean = |e: f64| {
+            let mut r = StdRng::seed_from_u64(42);
+            let mut total = 0u64;
+            for _ in 0..500 {
+                total += next_delay_seconds(e, &mut r);
+            }
+            total / 500
+        };
+        assert!(
+            mean(0.9) < mean(0.1),
+            "livelier persona should act more often"
+        );
     }
 
     #[test]

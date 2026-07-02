@@ -92,9 +92,17 @@ history corpus happens to contain.
 
 Interest threading: the goal layer prefers a seed the persona has NOT used
 recently (tracked in `recent_seeds`), so consecutive sessions walk through the
-persona's interests (fountain pen ink, then blotting paper, then nib grinding)
-rather than repeating one. Every candidate, from any source, still passes the
-harmful-query blocklist and the Safety Gate.
+persona's interests rather than repeating one. On top of that, a policy can
+declare authored narrative arcs (`seed_followups`): after pursuing a seed, the
+next seed in the same category is biased toward its follow-ups, so an interest
+unfolds as a multi-day thread (fountain pens, then blotting paper, then cheap
+paper). Every candidate, from any source, still passes the harmful-query
+blocklist and the Safety Gate.
+
+Cadence jitter: each plan carries a `suggested_next_delay_seconds`, an
+exponential (Poisson-like) inter-arrival scaled by energy, so a driver schedules
+a non-metronomic cadence (a perfectly regular clock tick is itself a
+fingerprint).
 
 ## Needs, domains, and a life beyond hobbies
 

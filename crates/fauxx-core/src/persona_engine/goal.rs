@@ -384,10 +384,12 @@ fn routine_affinity(policy: &PersonaPolicy) -> HashMap<String, f64> {
         .collect()
 }
 
-/// Choose a topic seed for `category`, threading through the persona's interests:
-/// prefer a seed not in the recent-seed history (so sessions progress), falling
-/// back to the full seed set when they have all been used lately. `None` when the
-/// category declares no seeds.
+/// Choose a topic seed for `category`, threading through the persona's interests.
+///
+/// Priority: (1) an AUTHORED follow-up of the most recent seed that lives in this
+/// category (so an arc unfolds: ink -> blotting paper -> nib grinding), else
+/// (2) a seed not used recently (so sessions still progress), else (3) any seed.
+/// `None` when the category declares no seeds.
 fn choose_seed(
     policy: &PersonaPolicy,
     category: CategoryPool,
@@ -398,6 +400,22 @@ fn choose_seed(
     if seeds.is_empty() {
         return None;
     }
+
+    // (1) Authored narrative arc: follow the most recent seed's declared
+    // follow-ups, restricted to this category's seeds and not-just-used.
+    if let Some(last) = state.recent_seeds.last() {
+        if let Some(followups) = policy.seed_followups.get(last) {
+            let arc: Vec<&String> = seeds
+                .iter()
+                .filter(|s| followups.contains(s) && !state.recent_seeds.contains(s))
+                .collect();
+            if !arc.is_empty() {
+                return Some(arc[rng.random_range(0..arc.len())].clone());
+            }
+        }
+    }
+
+    // (2) Otherwise prefer a seed not used recently; (3) fall back to all.
     let fresh: Vec<&String> = seeds
         .iter()
         .filter(|s| !state.recent_seeds.contains(s))
@@ -542,6 +560,25 @@ mod tests {
         let ga = GoalLayer.select(&policy, &state, &tick, t, &mut a);
         let gb = GoalLayer.select(&policy, &state, &tick, t, &mut b);
         assert_eq!(ga.goal, gb.goal);
+    }
+
+    #[test]
+    fn choose_seed_follows_authored_arc() {
+        // Having just pursued "fountain pens", the next CRAFTS seed should be one
+        // of its authored follow-ups (an unfolding narrative arc).
+        let policy = elias();
+        let mut state = BehaviorState::new("elias_rickensworth");
+        state.recent_seeds = vec!["fountain pens".to_string()];
+        for seed in 0..40u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let Some(pick) = choose_seed(&policy, CategoryPool::CRAFTS, &state, &mut rng) else {
+                panic!("CRAFTS has seeds");
+            };
+            assert!(
+                ["blue black ink", "blotting paper"].contains(&pick.as_str()),
+                "expected an arc follow-up of fountain pens, got {pick}"
+            );
+        }
     }
 
     #[test]

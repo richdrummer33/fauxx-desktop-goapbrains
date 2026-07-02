@@ -105,6 +105,22 @@ SCIENCE = [
     "why does air pressure drop before rain",
 ]
 
+# Authored narrative arcs: one seed naturally leads to the next, so Elias's
+# interests unfold as multi-day threads (ink today, blotting paper tomorrow,
+# nib care next week) rather than a random walk. Follow-ups are biased only when
+# they belong to the same category as the seed just pursued.
+[seed_followups]
+"fountain pens" = ["blue black ink", "blotting paper"]
+"blue black ink" = ["blotting paper", "cheap paper for fountain pens"]
+"blotting paper" = ["cheap paper for fountain pens"]
+"antique barometers" = ["old weather maps"]
+"railway history" = ["victorian railway lamps", "historical atlases"]
+"victorian railway lamps" = ["railway history"]
+"garden railways" = ["miniature ballast", "model track cleaning"]
+"miniature ballast" = ["model track cleaning"]
+"rainwater barrels" = ["shed maintenance"]
+"shed maintenance" = ["brass door hinges"]
+
 # Anti-coherence: too much consistency is itself a fingerprint. Elias lets topics
 # cool, occasionally pivots to something boring, and sometimes skips a day.
 [topic_decay]

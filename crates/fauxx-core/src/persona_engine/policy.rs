@@ -82,6 +82,13 @@ pub struct PersonaPolicy {
     /// Free-text topics the persona actively avoids (flavor + a soft down-weight).
     #[serde(default)]
     pub disinterests: Vec<String>,
+    /// Authored narrative arcs: seed -> the follow-up seeds it naturally leads to
+    /// (e.g. `fountain pens` -> `blotting paper` -> `nib grinding`). When the
+    /// persona recently pursued a seed, the goal layer biases the NEXT seed in the
+    /// same category toward its follow-ups, so interests unfold as multi-day
+    /// threads instead of random walks. Additive; empty is fine.
+    #[serde(default)]
+    pub seed_followups: BTreeMap<String, Vec<String>>,
     /// The persona's daily routines (time-of-day windows and their goals).
     #[serde(default)]
     pub routines: Vec<Routine>,
