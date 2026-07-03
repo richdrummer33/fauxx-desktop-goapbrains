@@ -43,6 +43,7 @@ pub mod persona;
 pub mod run;
 pub mod schedule;
 pub mod search;
+pub mod simulate;
 pub mod serve;
 pub mod serve_config;
 pub mod status;

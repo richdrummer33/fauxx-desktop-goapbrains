@@ -120,6 +120,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
         Command::Drift(args) => commands::drift::run(config, args).await,
         Command::Pack { command } => commands::pack::run(config, command).await,
         Command::Generate(args) => commands::generate::run(config, args).await,
+        Command::Simulate(args) => commands::simulate::run(config, args).await,
         Command::Mint(args) => commands::mint::run(config, args).await,
         Command::Egress { command } => commands::egress::run(config, command).await,
         Command::Dns { command } => commands::dns::run(config, command).await,

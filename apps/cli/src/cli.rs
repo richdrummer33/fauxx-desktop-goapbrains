@@ -307,6 +307,13 @@ pub enum Command {
     /// Run a generation pass producing signed artifacts (C6 #28).
     Generate(GenerateArgs),
 
+    /// Preview a synthetic week of decoy activity for a persona (C5 #26 P3):
+    /// simulate seven days of category-weighted query sessions using the same
+    /// circadian Poisson model as execution, with no real browsing or network.
+    /// The same `(persona, intensity, seed)` always yields an identical week;
+    /// pass a different `--seed` to re-roll.
+    Simulate(SimulateArgs),
+
     /// Mint N coherent PUMS personas into a signed pack (C6 #29).
     Mint(MintArgs),
 
@@ -761,6 +768,22 @@ pub enum PackCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Arguments for `fauxx-cli simulate` (C5 #26 P3).
+#[derive(Args, Debug)]
+pub struct SimulateArgs {
+    /// The persona id to simulate a week for.
+    pub persona_id: String,
+    /// The decoy intensity to simulate at.
+    #[arg(long, value_enum, default_value_t = IntensityArg::Medium)]
+    pub intensity: IntensityArg,
+    /// Seed making the simulation deterministic (same seed = identical week).
+    #[arg(long, default_value_t = 0)]
+    pub seed: u64,
+    /// Emit the full SimulatedWeek as JSON instead of the human-readable summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `fauxx-cli generate` (C6 #28).
