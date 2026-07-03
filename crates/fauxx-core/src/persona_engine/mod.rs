@@ -43,6 +43,7 @@ pub mod appraise;
 pub mod builtins;
 pub mod goal;
 pub mod kernel;
+pub mod llm;
 pub mod log;
 pub mod needs;
 pub mod planner;
@@ -56,6 +57,7 @@ pub mod world;
 pub use appraise::{appraise, Appraisal};
 pub use goal::{DecoyGoal, GoalLayer};
 pub use kernel::{BehaviorKernel, BehaviorState};
+pub use llm::{LlmConfig, LlmTransport, LmStudioAssistant, LmStudioTransport};
 pub use log::ActivityRecord;
 pub use needs::NeedState;
 pub use planner::{Intent, Planner};
@@ -192,17 +194,19 @@ pub fn plan_tick(
     seed: u64,
 ) -> DryRunReport {
     let kernel = BehaviorKernel;
+    let day_before_advance = state.world.last_reflected_day;
     let tick = kernel.advance(state, policy, now);
     let mut rng = StdRng::seed_from_u64(seed);
 
     // Sense: an offline life event may (rarely) fire; appraise it against the
-    // persona's fixed identity and current world-model, and ingest it (record a
-    // memory, and adopt a discovered interest) if it clears the notice bar.
-    // This runs BEFORE goal selection so a same-tick discovery can, in
-    // principle, already nudge what gets picked (its weight starts low, so in
-    // practice it takes reinforcement over several sessions to really pull).
+    // persona's fixed identity and current world-model (with an optional LLM
+    // salience nudge), and ingest it (record a memory, and adopt a discovered
+    // interest) if it clears the notice bar. This runs BEFORE goal selection so
+    // a same-tick discovery can, in principle, already nudge what gets picked
+    // (its weight starts low, so in practice it takes reinforcement over
+    // several sessions to really pull).
     let sensed = stimulus::roll_life_event(policy, &mut rng).map(|stim| {
-        let appraisal = appraise::appraise(policy, state, &stim);
+        let appraisal = appraise::appraise(policy, state, &stim, sidecar);
         appraise::ingest(state, &stim, &appraisal, now);
         SensedStimulus {
             text: stim.text.clone(),
@@ -212,6 +216,34 @@ pub fn plan_tick(
             adopted_seed: appraisal.adopted_seed.clone(),
         }
     });
+
+    // If the kernel's deterministic daily reflection just ran (the day
+    // changed), optionally fold in a genuine LLM-written insight over the
+    // recent memories. A disabled/erroring sidecar leaves this a no-op, so the
+    // deterministic dominant-tag insight from `WorldState::reflect` stands
+    // alone, exactly as in the no-LLM path.
+    if sidecar.is_enabled() && state.world.last_reflected_day != day_before_advance {
+        let recent: Vec<String> = state
+            .world
+            .top_memories(now, 12)
+            .into_iter()
+            .map(|m| m.text.clone())
+            .collect();
+        if let Some(insight) = sidecar.summarize_memory(&recent) {
+            let insight = insight.trim();
+            if !insight.is_empty() && insight.chars().count() <= 200 {
+                state.world.remember(world::Memory {
+                    at: now,
+                    kind: world::MemoryKind::Reflection,
+                    text: insight.to_string(),
+                    salience: 0.6,
+                    tags: vec!["llm_reflection".to_string()],
+                    last_access: now,
+                    hits: 0,
+                });
+            }
+        }
+    }
 
     let selection = GoalLayer.select(policy, state, &tick, now, &mut rng);
     // Jittered inter-arrival so a driver never schedules a metronomic cadence.

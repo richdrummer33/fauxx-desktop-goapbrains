@@ -49,6 +49,7 @@
 
 use crate::persona_engine::kernel::BehaviorState;
 use crate::persona_engine::policy::PersonaPolicy;
+use crate::persona_engine::sidecar::SemanticAssistant;
 use crate::persona_engine::stimulus::{Stimulus, StimulusSource};
 use crate::persona_engine::world::{Memory, MemoryKind};
 use crate::querybank::QueryBlocklist;
@@ -82,8 +83,17 @@ pub struct Appraisal {
 }
 
 /// Appraise `stimulus` against `policy` (fixed identity) and `state` (current
-/// world/needs/mood). Pure; performs no mutation and no I/O.
-pub fn appraise(policy: &PersonaPolicy, state: &BehaviorState, stimulus: &Stimulus) -> Appraisal {
+/// world/needs/mood). `sidecar` may optionally nudge the computed salience
+/// (see [`SemanticAssistant::appraise_salience`]); a disabled/erroring
+/// assistant is neutral (no nudge). Deterministic given `state`/`policy` and
+/// whatever `sidecar` returns; performs no mutation itself (that is
+/// [`ingest`]'s job).
+pub fn appraise(
+    policy: &PersonaPolicy,
+    state: &BehaviorState,
+    stimulus: &Stimulus,
+    sidecar: &dyn SemanticAssistant,
+) -> Appraisal {
     let value_fit = category_value_fit(policy, stimulus.category.as_deref());
     if !value_fit {
         return Appraisal {
@@ -110,9 +120,20 @@ pub fn appraise(policy: &PersonaPolicy, state: &BehaviorState, stimulus: &Stimul
         .unwrap_or(0.0);
     let curiosity_gain = 0.4 + 0.8 * personality.openness;
 
-    let salience =
-        (attention * (relevance + curiosity_gain * novelty + need_pull) * stimulus.base_weight)
-            .clamp(0.0, 3.0);
+    let deterministic_salience =
+        attention * (relevance + curiosity_gain * novelty + need_pull) * stimulus.base_weight;
+
+    // Optional LLM nudge: a bounded MULTIPLICATIVE factor in [0.5, 1.5] derived
+    // from an [0, 1] "how much would he care" rating, so the sidecar can amplify
+    // or damp what gets noticed but never solely decide it, and a disabled or
+    // out-of-range response is neutral (factor 1.0, i.e. no change at all).
+    let llm_factor = sidecar
+        .appraise_salience(&stimulus.text, stimulus.category.as_deref())
+        .filter(|v| v.is_finite())
+        .map(|v| 0.5 + v.clamp(0.0, 1.0))
+        .unwrap_or(1.0);
+
+    let salience = (deterministic_salience * llm_factor).clamp(0.0, 3.0);
     let noticed = salience >= NOTICE_THRESHOLD;
 
     // A more open persona adopts more readily (a lower bar), but adoption is
@@ -227,6 +248,7 @@ fn novelty_score(state: &BehaviorState, stimulus: &Stimulus) -> f64 {
 mod tests {
     use super::*;
     use crate::persona_engine::builtins;
+    use crate::persona_engine::sidecar::DisabledAssistant;
 
     fn elias() -> PersonaPolicy {
         match builtins::get("elias_rickensworth") {
@@ -255,7 +277,7 @@ mod tests {
             need: None,
             base_weight: 5.0,
         };
-        let a = appraise(&policy, &state, &stim);
+        let a = appraise(&policy, &state, &stim, &DisabledAssistant);
         assert!(!a.value_fit);
         assert_eq!(a.salience, 0.0);
         assert!(!a.noticed);
@@ -275,7 +297,7 @@ mod tests {
             need: Some("wellbeing".to_string()),
             base_weight: 10.0,
         };
-        let a = appraise(&policy, &state, &stim);
+        let a = appraise(&policy, &state, &stim, &DisabledAssistant);
         assert!(!a.value_fit);
         assert!(!a.noticed);
     }
@@ -292,7 +314,7 @@ mod tests {
             need: Some("hobby".to_string()),
             base_weight: 2.0,
         };
-        let a = appraise(&policy, &state, &stim);
+        let a = appraise(&policy, &state, &stim, &DisabledAssistant);
         assert!(a.value_fit);
         assert!(a.noticed, "salience {}", a.salience);
         assert_eq!(
@@ -313,7 +335,7 @@ mod tests {
             need: Some("hobby".to_string()),
             base_weight: 2.0,
         };
-        let a = appraise(&policy, &state, &stim);
+        let a = appraise(&policy, &state, &stim, &DisabledAssistant);
         assert!(a.adopted_seed.is_none());
     }
 
@@ -329,7 +351,7 @@ mod tests {
             need: None,
             base_weight: 0.01,
         };
-        let a = appraise(&policy, &state, &stim);
+        let a = appraise(&policy, &state, &stim, &DisabledAssistant);
         assert!(!a.noticed, "expected low-weight stimulus to go unnoticed");
         ingest(&mut state, &stim, &a, 1000);
         assert!(state.world.memories.is_empty());
@@ -348,7 +370,7 @@ mod tests {
             need: Some("hobby".to_string()),
             base_weight: 2.0,
         };
-        let a = appraise(&policy, &state, &stim);
+        let a = appraise(&policy, &state, &stim, &DisabledAssistant);
         ingest(&mut state, &stim, &a, 1000);
         assert_eq!(state.world.interests.len(), before + 1);
         assert!(!state.world.memories.is_empty());
@@ -380,8 +402,8 @@ mod tests {
             need: None,
             base_weight: 0.6,
         };
-        let a_open = appraise(&open_policy, &state_open, &stim);
-        let a_closed = appraise(&closed_policy, &state_closed, &stim);
+        let a_open = appraise(&open_policy, &state_open, &stim, &DisabledAssistant);
+        let a_closed = appraise(&closed_policy, &state_closed, &stim, &DisabledAssistant);
         assert!(a_open.salience > a_closed.salience);
     }
 
@@ -402,8 +424,84 @@ mod tests {
             need: None,
             base_weight: 1.0,
         };
-        let a_focused = appraise(&focused, &state_focused, &stim);
-        let a_relaxed = appraise(&relaxed, &state_relaxed, &stim);
+        let a_focused = appraise(&focused, &state_focused, &stim, &DisabledAssistant);
+        let a_relaxed = appraise(&relaxed, &state_relaxed, &stim, &DisabledAssistant);
         assert!(a_relaxed.salience > a_focused.salience);
+    }
+
+    /// A stub assistant with a fixed, injectable salience rating, for testing
+    /// the LLM nudge without any network I/O.
+    struct StubSalienceAssistant(f64);
+    impl SemanticAssistant for StubSalienceAssistant {
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        fn appraise_salience(&self, _text: &str, _category: Option<&str>) -> Option<f64> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn llm_salience_nudge_can_amplify_or_damp_within_bounds() {
+        let policy = elias();
+        let state = seeded_state(&policy);
+        let stim = Stimulus {
+            source: StimulusSource::Offline,
+            text: "something modest happens".to_string(),
+            category: Some("HISTORY".to_string()),
+            suggests_seed: None,
+            need: None,
+            base_weight: 0.8,
+        };
+        let baseline = appraise(&policy, &state, &stim, &DisabledAssistant);
+        let amplified = appraise(&policy, &state, &stim, &StubSalienceAssistant(1.0));
+        let damped = appraise(&policy, &state, &stim, &StubSalienceAssistant(0.0));
+        // factor range is [0.5, 1.5]: a rating of 1.0 amplifies, 0.0 damps.
+        assert!(amplified.salience > baseline.salience);
+        assert!(damped.salience < baseline.salience);
+        assert!((amplified.salience - baseline.salience * 1.5).abs() < 1e-9);
+        assert!((damped.salience - baseline.salience * 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn llm_nudge_never_overrides_the_venn_gate() {
+        let policy = elias();
+        let state = seeded_state(&policy);
+        // FINANCE is outside Elias's Venn; even a maximal LLM rating cannot
+        // make this noticed, because value_fit is checked BEFORE the sidecar
+        // is ever consulted.
+        let stim = Stimulus {
+            source: StimulusSource::Offline,
+            text: "a stock tip".to_string(),
+            category: Some("FINANCE".to_string()),
+            suggests_seed: None,
+            need: None,
+            base_weight: 10.0,
+        };
+        let a = appraise(&policy, &state, &stim, &StubSalienceAssistant(1.0));
+        assert!(!a.value_fit);
+        assert_eq!(a.salience, 0.0);
+        assert!(!a.noticed);
+    }
+
+    #[test]
+    fn out_of_range_or_disabled_llm_rating_is_neutral() {
+        let policy = elias();
+        let state = seeded_state(&policy);
+        let stim = Stimulus {
+            source: StimulusSource::Offline,
+            text: "something happens".to_string(),
+            category: Some("HISTORY".to_string()),
+            suggests_seed: None,
+            need: None,
+            base_weight: 1.0,
+        };
+        let baseline = appraise(&policy, &state, &stim, &DisabledAssistant);
+        // An out-of-range rating is clamped into [0, 1] before use, so 5.0
+        // behaves exactly like 1.0 (fully amplified, never unbounded).
+        let clamped = appraise(&policy, &state, &stim, &StubSalienceAssistant(5.0));
+        let expected = appraise(&policy, &state, &stim, &StubSalienceAssistant(1.0));
+        assert!((clamped.salience - expected.salience).abs() < 1e-9);
+        assert!(clamped.salience > baseline.salience);
     }
 }

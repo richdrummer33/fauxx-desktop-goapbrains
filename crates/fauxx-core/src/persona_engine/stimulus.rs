@@ -34,6 +34,7 @@
 use rand::RngExt;
 
 use crate::persona_engine::policy::PersonaPolicy;
+use crate::persona_engine::sidecar::SemanticAssistant;
 
 /// Where a [`Stimulus`] originated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,17 +105,28 @@ fn from_life_event(event: &crate::persona_engine::policy::LifeEvent) -> Stimulus
     }
 }
 
-/// Build an online-discovery stimulus from a dispatched query. The MVP source
-/// of "what did he encounter online": the category/seed he was already
-/// searching, restated as something he might notice more of. A future LLM
-/// sidecar (`classify_page_text`) can replace this with genuine page content
-/// extraction without changing the appraisal contract.
-pub fn from_dispatched_query(category: &str, query_seed: &str) -> Stimulus {
+/// Build an online-discovery stimulus from a dispatched query. The baseline
+/// (deterministic-only) source of "what did he encounter online": the
+/// category/seed he was already searching, restated as something he might
+/// notice more of. When `sidecar` is enabled, it is asked to
+/// [`propose_subseed`](SemanticAssistant::propose_subseed) - the one thing the
+/// deterministic path structurally cannot do, genuinely invent a NEW topic
+/// rather than a new wording of an existing one. The suggestion is carried as
+/// `suggests_seed` UNVETTED: appraisal still enforces the category Venn gate
+/// and the harmful-query blocklist before it can ever be noticed or adopted.
+pub fn from_dispatched_query(
+    policy: &PersonaPolicy,
+    category: &str,
+    query_seed: &str,
+    sidecar: &dyn SemanticAssistant,
+) -> Stimulus {
+    let text = format!("came across more about {query_seed} while searching");
+    let suggests_seed = sidecar.propose_subseed(policy, category, &text);
     Stimulus {
         source: StimulusSource::Online,
-        text: format!("came across more about {query_seed} while searching"),
+        text,
         category: Some(category.to_string()),
-        suggests_seed: None,
+        suggests_seed,
         need: None,
         base_weight: 1.0,
     }
@@ -201,10 +213,42 @@ mod tests {
     }
 
     #[test]
-    fn dispatched_query_stimulus_carries_category_and_no_suggestion() {
-        let s = from_dispatched_query("CRAFTS", "blue black ink");
+    fn dispatched_query_stimulus_with_disabled_sidecar_suggests_nothing() {
+        use crate::persona_engine::sidecar::DisabledAssistant;
+        let policy = policy_with_events();
+        let s = from_dispatched_query(&policy, "CRAFTS", "blue black ink", &DisabledAssistant);
         assert_eq!(s.source, StimulusSource::Online);
         assert_eq!(s.category.as_deref(), Some("CRAFTS"));
         assert!(s.text.contains("blue black ink"));
+        assert!(s.suggests_seed.is_none());
+    }
+
+    #[test]
+    fn dispatched_query_stimulus_carries_sidecar_proposed_seed() {
+        struct StubAssistant;
+        impl SemanticAssistant for StubAssistant {
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            fn propose_subseed(
+                &self,
+                _persona: &PersonaPolicy,
+                _category: &str,
+                _context: &str,
+            ) -> Option<String> {
+                Some("model train weathering paint".to_string())
+            }
+        }
+        let policy = policy_with_events();
+        let s = from_dispatched_query(
+            &policy,
+            "OUTDOOR_RECREATION",
+            "garden railways",
+            &StubAssistant,
+        );
+        assert_eq!(
+            s.suggests_seed.as_deref(),
+            Some("model train weathering paint")
+        );
     }
 }

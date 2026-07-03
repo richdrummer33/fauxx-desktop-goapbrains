@@ -123,8 +123,9 @@ pub use orchestration::{
 pub use persona::SyntheticPersona;
 pub use persona_engine::{
     ActivityRecord, BehaviorKernel, BehaviorState, DecoyGoal, DisabledAssistant, DryRunReport,
-    GoalLayer, Intent, PersonaEngineRunOutcome, PersonaPolicy, Planner, PolicyIssue, PolicySummary,
-    SafetyDecision, SafetyGate, SemanticAssistant, SidecarConstraints, POLICY_SCHEMA_VERSION,
+    GoalLayer, Intent, LlmConfig, PersonaEngineRunOutcome, PersonaPolicy, Planner, PolicyIssue,
+    PolicySummary, SafetyDecision, SafetyGate, SemanticAssistant, SidecarConstraints,
+    POLICY_SCHEMA_VERSION,
 };
 pub use personapack::{
     sign_pack, sign_pack_with, verify_pack, verify_parsed_pack, PackContent, PackError,
@@ -3229,18 +3230,29 @@ impl Core {
     /// Compute a DRY-RUN planning report for `policy`: advance a copy of any
     /// persisted behavior state, select a goal, plan candidate intents, and run
     /// the Safety Gate. Pure: it does NOT persist the advanced state and performs
-    /// NO network call. `now` is epoch millis; `seed` makes the pass reproducible.
+    /// NO network call (even with `llm` enabled: LM Studio runs on loopback, not
+    /// the open internet, and a dry-run's sensing step is the only thing that
+    /// might consult it). `now` is epoch millis; `seed` makes the pass
+    /// reproducible. `llm` is the optional local LLM sidecar config; `None` (or
+    /// a config with `enabled: false`) uses the deterministic-only
+    /// [`DisabledAssistant`].
     pub async fn persona_engine_plan(
         &self,
         policy: &PersonaPolicy,
         now: i64,
         seed: u64,
+        llm: Option<LlmConfig>,
     ) -> Result<DryRunReport> {
         let mut state = self.persona_engine_state_or_new(&policy.id).await?;
         let gate = SafetyGate::new();
-        let sidecar = DisabledAssistant;
+        let sidecar = build_sidecar(llm);
         Ok(persona_engine::plan_tick(
-            policy, &mut state, &sidecar, &gate, now, seed,
+            policy,
+            &mut state,
+            sidecar.as_ref(),
+            &gate,
+            now,
+            seed,
         ))
     }
 
@@ -3252,7 +3264,9 @@ impl Core {
     /// launches the persona's isolated decoy browser, dispatches the
     /// Safety-Gate-approved queries through the guarded search path, persists the
     /// advanced behavior state and the activity log, and returns the outcome.
-    /// Requires an open store for a live run.
+    /// Requires an open store for a live run. `llm` is the optional local LLM
+    /// sidecar config (see [`persona_engine_plan`](Self::persona_engine_plan));
+    /// it never chooses URLs or action types and never bypasses the Safety Gate.
     pub async fn persona_engine_run_once(
         &self,
         policy: &PersonaPolicy,
@@ -3260,11 +3274,13 @@ impl Core {
         now: i64,
         seed: u64,
         dry_run: bool,
+        llm: Option<LlmConfig>,
     ) -> Result<PersonaEngineRunOutcome> {
         let mut state = self.persona_engine_state_or_new(&policy.id).await?;
         let gate = SafetyGate::new();
-        let sidecar = DisabledAssistant;
-        let report = persona_engine::plan_tick(policy, &mut state, &sidecar, &gate, now, seed);
+        let sidecar = build_sidecar(llm);
+        let report =
+            persona_engine::plan_tick(policy, &mut state, sidecar.as_ref(), &gate, now, seed);
 
         if dry_run {
             return Ok(PersonaEngineRunOutcome {
@@ -3396,18 +3412,25 @@ impl Core {
                 state.record_action(&intent.category, &intent.query_seed, now);
                 // Sense: what he dispatched is itself something he encountered
                 // online. Appraise + ingest it, so the world-model reflects
-                // real activity, not just authored offline life events. The
-                // deterministic path cannot invent a genuinely NEW topic from
-                // this (no page-content extraction); it mainly reinforces
-                // relevance for future appraisal. A future LLM sidecar
-                // (`classify_page_text`) can extract real candidate topics from
-                // the visited page without changing this call site.
+                // real activity, not just authored offline life events. With the
+                // sidecar disabled (the default), the deterministic path cannot
+                // invent a genuinely NEW topic from this; it mainly reinforces
+                // relevance for future appraisal. With an enabled LLM sidecar,
+                // `from_dispatched_query` asks it to propose a closely-related
+                // new topic (still Venn- and blocklist-gated before it can ever
+                // be adopted).
                 let online_stim = persona_engine::stimulus::from_dispatched_query(
+                    policy,
                     &intent.category,
                     &intent.query_seed,
+                    sidecar.as_ref(),
                 );
-                let online_appraisal =
-                    persona_engine::appraise::appraise(policy, &state, &online_stim);
+                let online_appraisal = persona_engine::appraise::appraise(
+                    policy,
+                    &state,
+                    &online_stim,
+                    sidecar.as_ref(),
+                );
                 persona_engine::appraise::ingest(&mut state, &online_stim, &online_appraisal, now);
                 activity.push(persona_engine::make_activity_record(
                     policy,
@@ -3517,6 +3540,24 @@ impl Core {
             // No sync identity: a fixed, arbitrary nonzero seed.
             None => 0xFAFA_FAFA_FAFA_FAFA,
         }
+    }
+}
+
+/// Build the persona-engine semantic sidecar for a planning/run-once call.
+/// `None`, or a config with `enabled: false`, always yields the deterministic
+/// [`DisabledAssistant`] (no runtime dependency on LM Studio, no network path);
+/// only an explicit, operator-supplied `LlmConfig { enabled: true, .. }` builds
+/// a real [`persona_engine::llm::LmStudioAssistant`] talking to the local
+/// endpoint it names.
+fn build_sidecar(llm: Option<LlmConfig>) -> Box<dyn SemanticAssistant> {
+    match llm {
+        Some(config) if config.enabled => {
+            let transport = persona_engine::llm::LmStudioTransport::new(&config);
+            Box::new(persona_engine::llm::LmStudioAssistant::new(
+                config, transport,
+            ))
+        }
+        _ => Box::new(DisabledAssistant),
     }
 }
 

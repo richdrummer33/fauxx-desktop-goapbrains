@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use fauxx_core::persona_engine::builtins;
 use fauxx_core::{
-    Config, Core, DryRunReport, PersonaEngineRunOutcome, PersonaPolicy, PolicySummary,
+    Config, Core, DryRunReport, LlmConfig, PersonaEngineRunOutcome, PersonaPolicy, PolicySummary,
 };
 
 use crate::cli::{PersonaEngineCommand, PersonaEngineLogFormat, PersonaEngineLogsCommand};
@@ -44,7 +44,13 @@ pub async fn run(config: Config, command: PersonaEngineCommand) -> anyhow::Resul
             seed,
             now,
             json,
-        } => plan(config, &persona, seed, now, json).await,
+            llm,
+            llm_endpoint,
+            llm_model,
+        } => {
+            let llm_config = llm_config_from_flags(llm, llm_endpoint, llm_model);
+            plan(config, &persona, seed, now, json, llm_config).await
+        }
         PersonaEngineCommand::RunOnce {
             persona,
             dry_run,
@@ -52,7 +58,16 @@ pub async fn run(config: Config, command: PersonaEngineCommand) -> anyhow::Resul
             seed,
             now,
             json,
-        } => run_once(config, &persona, dry_run, decoy_id, seed, now, json).await,
+            llm,
+            llm_endpoint,
+            llm_model,
+        } => {
+            let llm_config = llm_config_from_flags(llm, llm_endpoint, llm_model);
+            run_once(
+                config, &persona, dry_run, decoy_id, seed, now, json, llm_config,
+            )
+            .await
+        }
         PersonaEngineCommand::Logs { command } => match command {
             PersonaEngineLogsCommand::Export {
                 persona,
@@ -160,17 +175,19 @@ fn validate(target: &str) -> anyhow::Result<()> {
 }
 
 /// Dry-run the pipeline (opens the core to read persisted state; never writes).
+#[allow(clippy::too_many_arguments)]
 async fn plan(
     config: Config,
     persona: &str,
     seed: u64,
     now: Option<i64>,
     json: bool,
+    llm: Option<LlmConfig>,
 ) -> anyhow::Result<()> {
     let policy = resolve_policy(persona)?;
     let now = now.unwrap_or_else(now_millis);
     let core = Core::open(config).await?;
-    let report = core.persona_engine_plan(&policy, now, seed).await?;
+    let report = core.persona_engine_plan(&policy, now, seed, llm).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -180,6 +197,7 @@ async fn plan(
 }
 
 /// Run one tick (dry-run or live).
+#[allow(clippy::too_many_arguments)]
 async fn run_once(
     config: Config,
     persona: &str,
@@ -188,12 +206,13 @@ async fn run_once(
     seed: u64,
     now: Option<i64>,
     json: bool,
+    llm: Option<LlmConfig>,
 ) -> anyhow::Result<()> {
     let policy = resolve_policy(persona)?;
     let now = now.unwrap_or_else(now_millis);
     let core = Core::open(config).await?;
     let outcome = core
-        .persona_engine_run_once(&policy, decoy_id, now, seed, dry_run)
+        .persona_engine_run_once(&policy, decoy_id, now, seed, dry_run, llm)
         .await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&outcome)?);
@@ -201,6 +220,20 @@ async fn run_once(
         print_run_outcome(&outcome);
     }
     Ok(())
+}
+
+/// Build an [`LlmConfig`] from the CLI's `--llm`/`--llm-endpoint`/`--llm-model`
+/// flags, or `None` when `--llm` was not passed (the deterministic-only path).
+fn llm_config_from_flags(enabled: bool, endpoint: String, model: String) -> Option<LlmConfig> {
+    if !enabled {
+        return None;
+    }
+    Some(LlmConfig {
+        enabled: true,
+        endpoint,
+        model,
+        ..LlmConfig::default()
+    })
 }
 
 /// Export the decoy activity log as JSONL (to a file or stdout).

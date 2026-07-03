@@ -100,6 +100,35 @@ pub trait SemanticAssistant: Send + Sync {
     fn explain_action(&self, _category: &str, _query: &str) -> Option<String> {
         None
     }
+
+    /// Propose ONE new, closely-related topic seed near an existing interest,
+    /// for the ONLY thing the deterministic path structurally cannot do:
+    /// genuinely invent a new topic (rather than a new wording of one).
+    /// `category` is the already-approved category the seed must belong to;
+    /// `context` is a short, local description of what prompted the ask (e.g.
+    /// "came across more about garden railways while searching"). The caller
+    /// (`crate::persona_engine::stimulus`) treats the result as an unvetted
+    /// SUGGESTION: it still must clear the category Venn and the harmful-query
+    /// blocklist before it can ever be noticed, let alone adopted.
+    fn propose_subseed(
+        &self,
+        _persona: &PersonaPolicy,
+        _category: &str,
+        _context: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Rate, in `[0, 1]`, how much this persona would plausibly care about a
+    /// short observation. Used ONLY as a bounded MULTIPLICATIVE nudge on the
+    /// deterministic appraisal salience
+    /// (`crate::persona_engine::appraise::appraise`): it can amplify or damp
+    /// what gets noticed, but a disabled/erroring/out-of-range response is
+    /// treated as neutral (no nudge), and it can never override the hard
+    /// category Venn gate that appraisal enforces before this is even called.
+    fn appraise_salience(&self, _stimulus_text: &str, _category: Option<&str>) -> Option<f64> {
+        None
+    }
 }
 
 /// The default, disabled assistant. Every method returns "unavailable", so the
@@ -153,6 +182,12 @@ mod tests {
         assert!(a.summarize_memory(&["x".to_string()]).is_none());
         assert!(a.classify_page_text("hello").is_none());
         assert!(a.explain_action("CRAFTS", "fountain pens").is_none());
+        assert!(a
+            .propose_subseed(&policy, "CRAFTS", "came across more about pens")
+            .is_none());
+        assert!(a
+            .appraise_salience("something happened", Some("CRAFTS"))
+            .is_none());
     }
 
     #[test]

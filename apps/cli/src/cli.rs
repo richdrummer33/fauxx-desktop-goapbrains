@@ -1021,6 +1021,17 @@ pub enum PersonaEngineCommand {
         /// Emit the dry-run report as JSON instead of a summary.
         #[arg(long)]
         json: bool,
+        /// Opt in to the optional local LLM sidecar (LM Studio). Off by
+        /// default: the deterministic pipeline never needs it, and a disabled
+        /// sidecar never calls out.
+        #[arg(long)]
+        llm: bool,
+        /// The LM Studio server's `host:port` (only used with `--llm`).
+        #[arg(long, default_value = "127.0.0.1:1234", value_name = "HOST:PORT")]
+        llm_endpoint: String,
+        /// The model id LM Studio has loaded (only used with `--llm`).
+        #[arg(long, default_value = "local-model")]
+        llm_model: String,
     },
 
     /// Run ONE tick for a persona. With `--dry-run` this is exactly `plan`.
@@ -1045,6 +1056,17 @@ pub enum PersonaEngineCommand {
         /// Emit the outcome as JSON instead of a summary.
         #[arg(long)]
         json: bool,
+        /// Opt in to the optional local LLM sidecar (LM Studio). Off by
+        /// default: the deterministic pipeline never needs it, and a disabled
+        /// sidecar never calls out.
+        #[arg(long)]
+        llm: bool,
+        /// The LM Studio server's `host:port` (only used with `--llm`).
+        #[arg(long, default_value = "127.0.0.1:1234", value_name = "HOST:PORT")]
+        llm_endpoint: String,
+        /// The model id LM Studio has loaded (only used with `--llm`).
+        #[arg(long, default_value = "local-model")]
+        llm_model: String,
     },
 
     /// Decoy activity logs for a persona.

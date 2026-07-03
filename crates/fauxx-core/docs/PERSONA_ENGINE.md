@@ -37,7 +37,9 @@ Persona Policy -> Behavior Kernel -> Sense/Appraise/Ingest -> Goal Layer
 - Planner (`persona_engine::planner`): turns the goal into structured candidate
   intents carrying the actual search query. Rules-first and deterministic; it
   never emits an arbitrary URL, and it keeps the persona IN CHARACTER (see below).
-- LLM Sidecar (`persona_engine::sidecar`): an optional helper. See limits below.
+- LLM Sidecar (`persona_engine::sidecar`, optionally backed by
+  `persona_engine::llm::LmStudioAssistant`): an optional, opt-in helper. See
+  limits below.
 - Safety Gate (`persona_engine::safety`): mandatory, deterministic, fail-closed
   enforcement. Every intent must pass before it can execute.
 - Executor: reuses `browser::search::dispatch_planned_queries`, which drives the
@@ -215,17 +217,40 @@ The sidecar is a helper, never a driver. It MUST NOT choose URLs, pick action
 types or modules, decide what the persona wants, escalate volume or risk, or
 bypass the Safety Gate. At most it phrases an already-approved query seed into
 candidate queries, summarizes prior activity into a local diary line, classifies
-page text, or writes a boring reason for an already-chosen action.
+page text, proposes ONE emergent sub-interest near an existing gravity well, or
+nudges the deterministic appraisal salience up or down.
 
 Rules enforced in code:
 
-- Disabled by default. The MVP ships only `DisabledAssistant`; there is no cloud
-  provider and no local model. Every method returns "unavailable", so the planner
-  always uses its deterministic fallback.
+- Disabled by default. `DisabledAssistant` is the default; every method returns
+  "unavailable", so the planner always uses its deterministic fallback. Nothing
+  about the deterministic pipeline depends on the LLM sidecar being present.
+- Opt-in, local-only. The only implementation shipped alongside
+  `DisabledAssistant` is `persona_engine::llm::LmStudioAssistant`, which talks to
+  a LOCAL LM Studio server (an OpenAI-compatible `POST /v1/chat/completions`
+  endpoint on loopback, e.g. `127.0.0.1:1234`) over plain HTTP. There is no cloud
+  provider, no bundled model, and no config path that reaches a non-loopback host
+  by default; enabling it is an explicit `--llm` opt-in (`LlmConfig { enabled:
+  true, .. }` at the API level).
 - Schema-validated output. Anything the sidecar returns is length/scope checked
-  and then re-gated by the harmful-query blocklist and the Safety Gate.
-- Deterministic fallback required. A disabled, erroring, or invalid sidecar is
-  indistinguishable to the planner from one that was never there.
+  and then re-gated by the harmful-query blocklist and the Safety Gate. A
+  proposed sub-interest must also name a category the persona is actually
+  allowed to have (`propose_subseed`), and still has to clear the appraisal
+  Venn gate before it can be noticed, let alone adopted.
+- Bounded, multiplicative influence only. `appraise_salience` returns a rating
+  in `[0, 1]` that is folded into the deterministic salience as a `[0.5, 1.5]`
+  multiplier (`appraise::appraise`); it can amplify or damp what gets noticed,
+  but the hard category Venn / safety gate is evaluated first and the LLM is
+  never consulted for anything the deterministic path has already ruled out.
+- Deterministic fallback required, fail-closed. A disabled config, a connection
+  error, a timeout, or a malformed/out-of-range response are all treated
+  identically to "unavailable": the planner falls back to the deterministic
+  path exactly as if the sidecar had never been consulted. The sync bridge from
+  the (synchronous) `SemanticAssistant` trait into the async transport
+  (`tokio::task::block_in_place` + `Handle::current().block_on`) requires being
+  called from a multi-threaded Tokio runtime, which `fauxx-cli`'s
+  `#[tokio::main]` provides; this is a documented constraint of an advanced,
+  opt-in feature, never exercised unless `--llm` is passed.
 
 ## Dry-run mode
 
@@ -261,10 +286,17 @@ fauxx-cli persona-engine plan --persona elias_rickensworth --dry-run
 fauxx-cli persona-engine run-once --persona elias_rickensworth --dry-run
 fauxx-cli persona-engine run-once --persona elias_rickensworth   # drives Chromium
 fauxx-cli persona-engine logs export --persona elias_rickensworth --format jsonl
+
+# Optional: augment appraisal/discovery with a local LM Studio model. Off by
+# default; requires an LM Studio server already running and listening locally.
+fauxx-cli persona-engine plan --persona elias_rickensworth --dry-run \
+    --llm --llm-endpoint 127.0.0.1:1234 --llm-model local-model
 ```
 
 `--seed` makes a pass reproducible and `--now <epoch-millis>` overrides the clock,
-so a run is fully deterministic for tests and scripted schedules.
+so a run is fully deterministic for tests and scripted schedules. `--llm` is
+available on both `plan` and `run-once`; `--llm-endpoint`/`--llm-model` are
+ignored unless `--llm` is also passed.
 
 ## Example dry-run output
 
@@ -312,12 +344,10 @@ optional; Elias is.
 
 Ad clicking, mock location, form or account or social interaction, arbitrary
 open-ended browsing, and full GOAP/HTN planning (the desire -> goal -> action
-selection in the world-model is deliberately GOAP-adjacent, not full GOAP). Any
-cloud or local LLM model call is still out of scope in this pass: the world-model
-above is fully deterministic. A later, OPT-IN LLM layer (local, via LM Studio)
-is planned to augment (never replace) the same seams: extracting real candidate
-topics from visited pages, nuanced salience appraisal, genuine reflective
-insight, and proposing emergent sub-interests near the persona's fixed gravity.
-Every one of those stays schema-validated, Venn- and blocklist-gated, and falls
-back to the deterministic path on any timeout, malformed output, or disabled
-config; it can be safely excluded entirely.
+selection in the world-model is deliberately GOAP-adjacent, not full GOAP). No
+cloud LLM call of any kind is ever made; the only network path the LLM sidecar
+can take is loopback to an operator-run LM Studio instance, and even that is
+off unless explicitly enabled (see "LLM sidecar limits" above). Extracting real
+candidate topics from a LIVE visited page's rendered text (`classify_page_text`
+against actual DOM content, rather than the dry-simulation's synthetic
+`from_dispatched_query` stimulus) remains unimplemented.
