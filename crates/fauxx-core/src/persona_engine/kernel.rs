@@ -80,7 +80,15 @@ pub struct BehaviorState {
     /// empty for state written before needs existed.
     #[serde(default)]
     pub needs: crate::persona_engine::needs::NeedState,
+    /// The world-model: the memory stream and the living interest graph (the
+    /// persona's evolving "awareness with meaning"). Additive; a state written
+    /// before the world-model existed gets an empty one, seeded on first
+    /// [`advance`](BehaviorKernel::advance) from the policy's authored seeds.
+    #[serde(default)]
+    pub world: crate::persona_engine::world::WorldState,
     /// Local-only persona diary summaries (bounded; decoy-only, no real data).
+    /// Superseded by `world.memories` for new content; retained for the
+    /// executor's coarse per-session summary line.
     pub memory_summaries: Vec<String>,
     /// Actions performed on `day_epoch` (for the soft daily budget).
     pub actions_today: u32,
@@ -104,6 +112,7 @@ impl BehaviorState {
             last_actions: Vec::new(),
             cooldowns: BTreeMap::new(),
             needs: crate::persona_engine::needs::NeedState::default(),
+            world: crate::persona_engine::world::WorldState::default(),
             memory_summaries: Vec::new(),
             actions_today: 0,
             day_epoch: 0,
@@ -136,6 +145,7 @@ impl BehaviorState {
         );
         if !seed.is_empty() {
             push_bounded(&mut self.recent_seeds, seed.to_string(), HISTORY_LIMIT);
+            self.world.reinforce(seed, now);
         }
         push_bounded(
             &mut self.last_actions,
@@ -225,6 +235,20 @@ impl BehaviorKernel {
         if day != state.day_epoch {
             state.day_epoch = day;
             state.actions_today = 0;
+        }
+
+        // World-model: seed the interest graph on first use (a no-op after),
+        // then run daily reflection (decay/prune discovered interests, reinforce,
+        // synthesize an insight memory) at most once per UTC day.
+        state.world.ensure_seeded(policy, now);
+        if day != state.world.last_reflected_day {
+            let world_elapsed_hours = if state.world.last_reflected_day > 0 {
+                ((day - state.world.last_reflected_day).max(0) as f64) * 24.0
+            } else {
+                0.0
+            };
+            state.world.reflect(now, world_elapsed_hours);
+            state.world.last_reflected_day = day;
         }
 
         // Circadian energy.

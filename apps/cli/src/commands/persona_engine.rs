@@ -104,8 +104,19 @@ fn show(name: &str, json: bool) -> anyhow::Result<()> {
     println!("display_name:  {}", policy.display_name);
     println!("schema:        v{}", policy.schema_version);
     println!("fiction:       {}", policy.fiction_notice.trim());
+    if !policy.identity.core_values.is_empty() {
+        println!("core_values:   {}", policy.identity.core_values.join(", "));
+    }
+    let p = &policy.identity.personality;
+    println!(
+        "personality:   O={:.2} C={:.2} E={:.2} A={:.2} N={:.2}",
+        p.openness, p.conscientiousness, p.extraversion, p.agreeableness, p.neuroticism
+    );
     println!("allowed:       {}", policy.allowed_categories.join(", "));
     println!("forbidden:     {}", policy.forbidden_categories.join(", "));
+    if !policy.life_events.is_empty() {
+        println!("life_events:   {} authored", policy.life_events.len());
+    }
     println!(
         "modules:       {}",
         policy.safety_policy.allowed_modules.join(", ")
@@ -248,6 +259,24 @@ fn print_report(report: &DryRunReport) {
         "state:           energy={:.2} curiosity={:.2} boredom={:.2}",
         s.energy, s.curiosity, s.boredom
     );
+    match &report.sensed {
+        Some(sensed) if sensed.noticed => {
+            let adopted = sensed
+                .adopted_seed
+                .as_deref()
+                .map(|s| format!("  -> new interest: \"{s}\""))
+                .unwrap_or_default();
+            println!(
+                "sensed:          (noticed, salience={:.2}) {}{adopted}",
+                sensed.salience, sensed.text
+            );
+        }
+        Some(sensed) => println!(
+            "sensed:          (unnoticed, salience={:.2}) {}",
+            sensed.salience, sensed.text
+        ),
+        None => {}
+    }
     if !s.topic_scores.is_empty() {
         let scores: Vec<String> = s
             .topic_scores
@@ -264,6 +293,20 @@ fn print_report(report: &DryRunReport) {
             .map(|(k, v)| format!("{k}={v:.2}"))
             .collect();
         println!("needs:           {}", needs.join(" "));
+    }
+    if !s.world.interests.is_empty() {
+        let discovered = s
+            .world
+            .interests
+            .iter()
+            .filter(|i| i.source == fauxx_core::persona_engine::world::InterestSource::Discovered)
+            .count();
+        println!(
+            "interests:       {} total ({} discovered)  memories={}",
+            s.world.interests.len(),
+            discovered,
+            s.world.memories.len()
+        );
     }
     if report.idle {
         println!("decision:        IDLE (no action this tick)");

@@ -3394,6 +3394,21 @@ impl Core {
                 .find(|d| d.query == intent.final_query);
             if let Some(d) = hit {
                 state.record_action(&intent.category, &intent.query_seed, now);
+                // Sense: what he dispatched is itself something he encountered
+                // online. Appraise + ingest it, so the world-model reflects
+                // real activity, not just authored offline life events. The
+                // deterministic path cannot invent a genuinely NEW topic from
+                // this (no page-content extraction); it mainly reinforces
+                // relevance for future appraisal. A future LLM sidecar
+                // (`classify_page_text`) can extract real candidate topics from
+                // the visited page without changing this call site.
+                let online_stim = persona_engine::stimulus::from_dispatched_query(
+                    &intent.category,
+                    &intent.query_seed,
+                );
+                let online_appraisal =
+                    persona_engine::appraise::appraise(policy, &state, &online_stim);
+                persona_engine::appraise::ingest(&mut state, &online_stim, &online_appraisal, now);
                 activity.push(persona_engine::make_activity_record(
                     policy,
                     report.current_routine.clone(),

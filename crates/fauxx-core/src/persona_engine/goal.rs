@@ -39,6 +39,7 @@ use crate::persona::CategoryPool;
 use crate::persona_engine::kernel::{BehaviorState, TickContext};
 use crate::persona_engine::policy::{Domain, PersonaPolicy, Routine};
 use crate::persona_engine::utility;
+use crate::persona_engine::world::{weighted_pick, Interest};
 
 /// A concrete goal chosen by the goal layer for one tick.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -384,49 +385,56 @@ fn routine_affinity(policy: &PersonaPolicy) -> HashMap<String, f64> {
         .collect()
 }
 
-/// Choose a topic seed for `category`, threading through the persona's interests.
+/// Choose a topic seed for `category`, threading through the persona's LIVING
+/// interest graph ([`crate::persona_engine::world::WorldState`]), not a flat
+/// authored list. This is what lets a discovered interest (adopted by
+/// appraisal) start pulling seed selection once it has been reinforced: the
+/// graph, not the policy, is now the source of truth for "what does he care
+/// about right now."
 ///
-/// Priority: (1) an AUTHORED follow-up of the most recent seed that lives in this
-/// category (so an arc unfolds: ink -> blotting paper -> nib grinding), else
-/// (2) a seed not used recently (so sessions still progress), else (3) any seed.
-/// `None` when the category declares no seeds.
+/// Priority: (1) an AUTHORED follow-up of the most recent seed that lives in
+/// this category (so an arc unfolds: ink -> blotting paper -> nib grinding),
+/// weighted-picked among the arc candidates; else (2) a not-recently-used
+/// candidate, weighted by [`Interest::effective_weight`] (so a hot authored
+/// interest or a reinforced discovery pulls harder); else (3) any candidate in
+/// the category, same weighting. `None` when the category has no interest nodes
+/// (the graph is always seeded from `topic_seeds` before this runs).
 fn choose_seed(
     policy: &PersonaPolicy,
     category: CategoryPool,
     state: &BehaviorState,
     rng: &mut impl RngExt,
 ) -> Option<String> {
-    let seeds = policy.topic_seeds_for(category);
-    if seeds.is_empty() {
+    let candidates = state.world.interests_for_category(category.as_name());
+    if candidates.is_empty() {
         return None;
     }
 
     // (1) Authored narrative arc: follow the most recent seed's declared
-    // follow-ups, restricted to this category's seeds and not-just-used.
+    // follow-ups, restricted to this category's candidates and not-just-used.
     if let Some(last) = state.recent_seeds.last() {
         if let Some(followups) = policy.seed_followups.get(last) {
-            let arc: Vec<&String> = seeds
+            let arc: Vec<&Interest> = candidates
                 .iter()
-                .filter(|s| followups.contains(s) && !state.recent_seeds.contains(s))
+                .filter(|i| followups.contains(&i.seed) && !state.recent_seeds.contains(&i.seed))
+                .copied()
                 .collect();
-            if !arc.is_empty() {
-                return Some(arc[rng.random_range(0..arc.len())].clone());
+            if let Some(pick) = weighted_pick(&arc, rng) {
+                return Some(pick.seed.clone());
             }
         }
     }
 
-    // (2) Otherwise prefer a seed not used recently; (3) fall back to all.
-    let fresh: Vec<&String> = seeds
+    // (2) Otherwise prefer a candidate not used recently; (3) fall back to all
+    // candidates in the category. Either way, weighted by how much the persona
+    // cares about it right now.
+    let fresh: Vec<&Interest> = candidates
         .iter()
-        .filter(|s| !state.recent_seeds.contains(s))
+        .filter(|i| !state.recent_seeds.contains(&i.seed))
+        .copied()
         .collect();
-    let pool: Vec<&String> = if fresh.is_empty() {
-        seeds.iter().collect()
-    } else {
-        fresh
-    };
-    let pick = pool[rng.random_range(0..pool.len())];
-    Some(pick.clone())
+    let pool: Vec<&Interest> = if fresh.is_empty() { candidates } else { fresh };
+    weighted_pick(&pool, rng).map(|i| i.seed.clone())
 }
 
 /// Convert scored categories to `(name, score)` label pairs for the report.
@@ -568,6 +576,7 @@ mod tests {
         // of its authored follow-ups (an unfolding narrative arc).
         let policy = elias();
         let mut state = BehaviorState::new("elias_rickensworth");
+        state.world.ensure_seeded(&policy, 0);
         state.recent_seeds = vec!["fountain pens".to_string()];
         for seed in 0..40u64 {
             let mut rng = StdRng::seed_from_u64(seed);

@@ -13,8 +13,8 @@ that is disabled by default and ships with no model in the MVP.
 ## The pipeline
 
 ```
-Persona Policy -> Behavior Kernel -> Goal Layer -> Planner
-    -> (optional) LLM Sidecar -> Safety Gate -> Executor -> Logs
+Persona Policy -> Behavior Kernel -> Sense/Appraise/Ingest -> Goal Layer
+    -> Planner -> (optional) LLM Sidecar -> Safety Gate -> Executor -> Logs
 ```
 
 - Persona Policy (`persona_engine::policy`): a TOML document that declares who a
@@ -26,6 +26,10 @@ Persona Policy -> Behavior Kernel -> Goal Layer -> Planner
   (time of day, weekday/weekend, energy on a circadian curve, curiosity,
   boredom, per-topic momentum with exponential decay, cooldowns). Pure and
   deterministic given the wall-clock time.
+- Sense / Appraise / Ingest (`persona_engine::stimulus`, `persona_engine::
+  appraise`, `persona_engine::world`): the persona's evolving world-model. See
+  below; this is what lets interests specialize over time while the persona's
+  fixed identity never moves.
 - Goal Layer (`persona_engine::goal`): the control plane. It scores the routine's
   candidate categories with the utility model (see below) and draws ONE with a
   temperature softmax, then fills in a goal: routine, goal type, action type,
@@ -130,6 +134,70 @@ real-life need (health) is modeled as offline, so the decoy never emits medical
 or other self-signalling queries on the persona's behalf. Domains are additive;
 a policy that declares none behaves exactly as before (one synthesized online
 `hobby` domain).
+
+## The world-model: memory, appraisal, and adaptive interests
+
+A persona's interests should not be a fixed shopping list forever. A real person
+notices things (something a neighbour says, a flyer, a page they read), holds
+onto the ones that matter to them, and lets those reshape what they pursue,
+while who they fundamentally ARE never changes. The persona engine models this
+with three small, deterministic pieces (`persona_engine::stimulus`,
+`persona_engine::appraise`, `persona_engine::world`), drawing on the Generative
+Agents memory-stream/reflection design (Park et al. 2023), ACT-R's cheap
+recency+frequency activation for retrieval and forgetting, BDI's split between
+fixed desires and a mutable world-model, and appraisal theories of interest and
+curiosity (the OCC model; Loewenstein's information-gap theory).
+
+**Identity is fixed and gravitational.** A policy's `[identity]` block declares
+`core_values` (flavor) and a Big Five (OCEAN) `personality` vector, each trait
+`0..1`. This NEVER changes at runtime. It only parameterizes the machinery
+below: Openness raises curiosity's weight in appraisal and lowers the bar to
+adopt a new interest (a more open persona specializes more readily, without
+wandering outside its Venn); Conscientiousness sharpens attention (a more
+task-focused persona notices less background stimulus). Elias is moderately
+open, highly conscientious, introverted, and placid.
+
+**Stimuli are candidate observations.** Offline, a policy's authored
+`[[life_events]]` are small, character-consistent "whims" (Sims-style: "a
+neighbour mentions a model railway swap meet") that fire rarely, not every tick.
+Online, a dispatched query itself becomes a stimulus (`stimulus::
+from_dispatched_query`); a future LLM sidecar seam (`classify_page_text`) can
+extract genuinely new candidate topics from a visited page's real text.
+
+**Appraisal decides what MATTERS.** Every stimulus is scored:
+
+```
+salience = value_fit * attention * (relevance + curiosity_gain * novelty + need_pull)
+```
+
+`value_fit` is a HARD gate: a stimulus about a category outside the policy's
+`allowed_categories` (or inside `forbidden_categories`) scores zero and is never
+noticed, full stop. This is simultaneously the Venn-diagram constraint interests
+may specialize WITHIN, and a safety boundary appraisal cannot cross. Above a
+notice threshold, the stimulus is recorded as a `Memory`; above a (Openness-
+adjusted, always blocklist- and Venn-gated) adopt threshold, its suggested seed
+is adopted into the interest graph.
+
+**The interest graph replaces the flat seed list at runtime.** Authored seeds
+(from `topic_seeds`) are permanent gravity wells that never decay below their
+floor. A newly adopted, discovered interest starts light and DECAYS if never
+reinforced; if it keeps getting noticed or pursued, its weight climbs and it
+starts winning seed selection within its category, same as a well-worn authored
+one. `choose_seed` (in `goal.rs`) draws from this graph, weighted, so
+specialization is a real, gradual, reversible pull, not a one-shot switch.
+
+**Reflection runs once a day**, folded into the kernel's routine advance:
+discovered interests decay (authored ones are untouched), anything below a
+floor is pruned, and if one tag dominates recent noticed memories, a synthesized
+insight memory is added (`"keeps returning to CRAFTS lately"`). This is the
+deterministic stand-in for an LLM writing genuine reflective insight.
+
+None of this executes anything by itself. A discovered interest is just another
+seed the (unchanged) planner and Safety Gate treat exactly like an authored one:
+blocklist-gated, category-Venn-gated, budget-capped. `persona-engine plan`
+shows the `sensed:` line (what fired this tick, its salience, whether it was
+noticed, and any adopted seed) and an `interests:` count (total / discovered),
+so the whole loop is inspectable in dry-run.
 
 ## The two identity models
 
@@ -243,6 +311,13 @@ optional; Elias is.
 ## Out of scope in the MVP (follow-ups)
 
 Ad clicking, mock location, form or account or social interaction, arbitrary
-open-ended browsing, any cloud or local LLM model call, and GOAP/HTN
-micro-planning. The MVP pipeline stays Routine -> Goal -> ActionType -> Category
--> Args -> Safety -> Execute.
+open-ended browsing, and full GOAP/HTN planning (the desire -> goal -> action
+selection in the world-model is deliberately GOAP-adjacent, not full GOAP). Any
+cloud or local LLM model call is still out of scope in this pass: the world-model
+above is fully deterministic. A later, OPT-IN LLM layer (local, via LM Studio)
+is planned to augment (never replace) the same seams: extracting real candidate
+topics from visited pages, nuanced salience appraisal, genuine reflective
+insight, and proposing emergent sub-interests near the persona's fixed gravity.
+Every one of those stays schema-validated, Venn- and blocklist-gated, and falls
+back to the deterministic path on any timeout, malformed output, or disabled
+config; it can be safely excluded entirely.

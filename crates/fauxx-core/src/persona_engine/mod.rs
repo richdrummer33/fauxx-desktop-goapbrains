@@ -39,6 +39,7 @@
 //! use, or where to browse. The goal layer chooses; the LLM, at most, phrases an
 //! already-approved query. See the crate `docs/PERSONA_ENGINE.md`.
 
+pub mod appraise;
 pub mod builtins;
 pub mod goal;
 pub mod kernel;
@@ -48,16 +49,23 @@ pub mod planner;
 pub mod policy;
 pub mod safety;
 pub mod sidecar;
+pub mod stimulus;
 mod utility;
+pub mod world;
 
+pub use appraise::{appraise, Appraisal};
 pub use goal::{DecoyGoal, GoalLayer};
 pub use kernel::{BehaviorKernel, BehaviorState};
 pub use log::ActivityRecord;
 pub use needs::NeedState;
 pub use planner::{Intent, Planner};
-pub use policy::{Domain, PersonaPolicy, PolicyIssue, POLICY_SCHEMA_VERSION};
+pub use policy::{
+    Domain, Identity, LifeEvent, PersonaPolicy, Personality, PolicyIssue, POLICY_SCHEMA_VERSION,
+};
 pub use safety::{SafetyDecision, SafetyGate};
 pub use sidecar::{DisabledAssistant, SemanticAssistant, SidecarConstraints};
+pub use stimulus::{roll_life_event, Stimulus, StimulusSource};
+pub use world::{Interest, InterestSource, Memory, MemoryKind, WorldState};
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -107,8 +115,13 @@ pub struct DryRunReport {
     pub persona_id: String,
     /// The policy version stamped on the report.
     pub policy_version: u32,
-    /// The behavior state after the kernel advanced it for this tick.
+    /// The behavior state after the kernel advanced it for this tick (includes
+    /// any world-model change from [`sensed`](Self::sensed)).
     pub behavior_state: BehaviorState,
+    /// The offline stimulus rolled and appraised this tick, if any (`None` on a
+    /// tick where no life event fired). Present even when NOT noticed, so a
+    /// dry-run can show "something happened but he didn't catch it".
+    pub sensed: Option<SensedStimulus>,
     /// The current routine name, or `None` during quiet hours.
     pub current_routine: Option<String>,
     /// Whether this tick is an idle/skipped run (quiet hours or a skipped day).
@@ -132,6 +145,21 @@ pub struct DryRunReport {
     pub no_network: bool,
 }
 
+/// A stimulus rolled and appraised on one tick, summarized for the report.
+#[derive(Debug, Clone, Serialize)]
+pub struct SensedStimulus {
+    /// The stimulus text (what happened).
+    pub text: String,
+    /// The category it was about, if any.
+    pub category: Option<String>,
+    /// The computed appraisal salience.
+    pub salience: f64,
+    /// Whether it cleared the notice threshold (and so was recorded as a memory).
+    pub noticed: bool,
+    /// The interest seed adopted into the world-model, if any.
+    pub adopted_seed: Option<String>,
+}
+
 /// The outcome of one `run-once` tick (dry-run or live).
 #[derive(Debug, Clone, Serialize)]
 pub struct PersonaEngineRunOutcome {
@@ -148,10 +176,13 @@ pub struct PersonaEngineRunOutcome {
     pub activity: Vec<ActivityRecord>,
 }
 
-/// Run ONE planning tick: advance the kernel, select a goal, plan candidate
-/// intents (deterministic fallback unless the sidecar is enabled and valid), run
-/// the Safety Gate, and truncate the approved plan to the policy's per-run action
-/// budget. Pure: mutates only `state`, performs no I/O and no network.
+/// Run ONE planning tick: advance the kernel, SENSE (roll an offline life
+/// event, appraise it, and ingest it into the world-model if noticed), select a
+/// goal, plan candidate intents (deterministic fallback unless the sidecar is
+/// enabled and valid), run the Safety Gate, and truncate the approved plan to
+/// the policy's per-run action budget. Pure: mutates only `state`, performs no
+/// I/O and no network (the sense step is itself a local computation over
+/// authored `[[life_events]]`, never a real observation of the outside world).
 pub fn plan_tick(
     policy: &PersonaPolicy,
     state: &mut BehaviorState,
@@ -163,6 +194,25 @@ pub fn plan_tick(
     let kernel = BehaviorKernel;
     let tick = kernel.advance(state, policy, now);
     let mut rng = StdRng::seed_from_u64(seed);
+
+    // Sense: an offline life event may (rarely) fire; appraise it against the
+    // persona's fixed identity and current world-model, and ingest it (record a
+    // memory, and adopt a discovered interest) if it clears the notice bar.
+    // This runs BEFORE goal selection so a same-tick discovery can, in
+    // principle, already nudge what gets picked (its weight starts low, so in
+    // practice it takes reinforcement over several sessions to really pull).
+    let sensed = stimulus::roll_life_event(policy, &mut rng).map(|stim| {
+        let appraisal = appraise::appraise(policy, state, &stim);
+        appraise::ingest(state, &stim, &appraisal, now);
+        SensedStimulus {
+            text: stim.text.clone(),
+            category: stim.category.clone(),
+            salience: appraisal.salience,
+            noticed: appraisal.noticed,
+            adopted_seed: appraisal.adopted_seed.clone(),
+        }
+    });
+
     let selection = GoalLayer.select(policy, state, &tick, now, &mut rng);
     // Jittered inter-arrival so a driver never schedules a metronomic cadence.
     let next_delay = kernel::next_delay_seconds(state.energy, &mut rng);
@@ -171,6 +221,7 @@ pub fn plan_tick(
         persona_id: policy.id.clone(),
         policy_version: policy.schema_version,
         behavior_state: state.clone(),
+        sensed,
         current_routine: tick.routine.clone(),
         idle: selection.idle,
         goal_scores: selection.scores,

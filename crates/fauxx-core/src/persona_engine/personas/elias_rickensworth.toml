@@ -58,6 +58,24 @@ home_location = "a draughty house with too many barometers"
 require_isolated_profile = true
 require_https = true
 
+# Elias's fixed, gravitational identity: who he fundamentally IS. This never
+# changes at runtime; it parameterizes appraisal (see [[life_events]] below and
+# crates/fauxx-core/src/persona_engine/appraise.rs) so his discovered interests
+# can specialize and drift WITHIN this Venn without his character ever moving.
+[identity]
+core_values = ["craftsmanship", "the past", "self-reliance", "quiet order"]
+
+# A Big Five (OCEAN) personality vector, each 0..1. Elias is moderately open (he
+# will pick up a new sub-interest, but slowly and only near what he already
+# loves), highly conscientious (routine-bound, not easily distracted by
+# passing novelty), introverted, mildly agreeable, and emotionally placid.
+[identity.personality]
+openness = 0.65
+conscientiousness = 0.78
+extraversion = 0.25
+agreeableness = 0.6
+neuroticism = 0.2
+
 # The frozen-model persona Elias materializes into for execution. His eccentric
 # hobbies are mapped onto the closest of the 32 frozen CategoryPool values.
 [backing_persona]
@@ -182,6 +200,7 @@ categories = ["HISTORY", "CRAFTS", "OUTDOOR_RECREATION", "SCIENCE"]
 online_bias = 0.95
 decay_per_hour = 0.08
 satisfy_amount = 0.45
+offline_label = "flips through an old railway magazine instead"
 goal_types = ["continue_hobby_thread", "browse_hobby"]
 
 [[domains]]
@@ -244,3 +263,58 @@ start_hour = 9
 end_hour = 22
 goal_types = ["long_hobby_session", "history_deep_dive"]
 categories = ["HISTORY", "CRAFTS", "HOME_IMPROVEMENT", "OUTDOOR_RECREATION"]
+
+# --- Life events (Sims-style "whims") ---
+# Small, authored, character-consistent happenings Elias MAY notice, not always
+# does. Each is a candidate stimulus scored by appraise.rs against his fixed
+# identity above; only a salient-enough one is remembered, and only a
+# salient-enough one that suggests an in-Venn, blocklist-safe seed is ever
+# adopted as a new interest. Nothing here executes anything by itself.
+[[life_events]]
+id = "railway_swap_meet"
+text = "a neighbour mentions a model railway swap meet at the village hall"
+category = "OUTDOOR_RECREATION"
+suggests_seed = "garden railway swap meet finds"
+need = "hobby"
+weight = 1.0
+
+[[life_events]]
+id = "shed_roof_leak"
+text = "a drip appears in the shed roof after a night of rain"
+category = "HOME_IMPROVEMENT"
+suggests_seed = "shed roof felt repair"
+need = "upkeep"
+weight = 0.9
+
+[[life_events]]
+id = "estate_sale_flyer"
+text = "a flyer for a house-clearance sale mentions an old writing desk"
+category = "CRAFTS"
+suggests_seed = "antique writing slope restoration"
+need = "hobby"
+weight = 0.7
+
+[[life_events]]
+id = "barometer_society_newsletter"
+text = "the local barometer society's newsletter arrives with a note on mercury tube repair"
+category = "SCIENCE"
+suggests_seed = "mercury barometer tube replacement"
+need = "hobby"
+weight = 0.6
+
+[[life_events]]
+id = "museum_signalling_talk"
+text = "a poster advertises a museum talk on Victorian railway signalling"
+category = "HISTORY"
+suggests_seed = "Victorian railway signalling history"
+need = "hobby"
+weight = 0.6
+
+# A purely need-only stimulus (no category, no suggested seed): it always
+# clears appraisal's Venn gate but can never itself become a new interest,
+# demonstrating the "not everything noticed is a new topic" case.
+[[life_events]]
+id = "quiet_stretch"
+text = "a quiet, unremarkable stretch of the day passes"
+need = "wellbeing"
+weight = 1.2

@@ -113,6 +113,126 @@ pub struct PersonaPolicy {
     /// policy that predates domains behaves exactly as before.
     #[serde(default)]
     pub domains: Vec<Domain>,
+    /// The fixed, gravitational identity core (core values + Big Five). NEVER
+    /// mutated by the engine; it parameterizes appraisal/attention so the
+    /// persona's mutable world-model (memory, discovered interests) can drift
+    /// and specialize WITHOUT the persona's fundamental character ever moving.
+    /// Additive: defaults to a neutral identity for a policy that predates it.
+    #[serde(default)]
+    pub identity: Identity,
+    /// Authored, character-consistent life events the persona may notice
+    /// offline. Each is a candidate STIMULUS the appraisal step scores for
+    /// salience; it is never executed directly and never bypasses the category
+    /// Venn or the Safety Gate. Additive; empty is fine (no offline stimuli).
+    #[serde(default)]
+    pub life_events: Vec<LifeEvent>,
+}
+
+/// The persona's fixed, gravitational identity: who they fundamentally ARE.
+/// Lives in the policy (never in mutable state) precisely because it must never
+/// change. It parameterizes the appraisal/attention machinery in
+/// [`crate::persona_engine::appraise`] rather than being consulted directly by
+/// the goal layer.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Identity {
+    /// Abstract value anchors in the persona's own words (e.g. "craftsmanship,
+    /// the past, self-reliance"), for flavor/logging and future LLM prompting.
+    /// Not machine-parsed; the Big Five vector below is what drives behavior.
+    #[serde(default)]
+    pub core_values: Vec<String>,
+    /// The Big Five (OCEAN) personality vector, each trait in `[0, 1]`.
+    #[serde(default)]
+    pub personality: Personality,
+}
+
+/// A Big Five (OCEAN) personality vector, each trait in `[0, 1]`. Fixed for the
+/// life of the persona; it parameterizes (does not replace) the deterministic
+/// appraisal/goal machinery. See `appraise.rs` doc comments for the exact
+/// trait -> knob mapping (openness -> novelty weight + adoption threshold;
+/// conscientiousness -> attention focus + routine discipline; extraversion ->
+/// activity/energy floor; agreeableness -> a gentle low-salience bias against
+/// conflict content; neuroticism -> need-decay volatility + boredom
+/// sensitivity). A neutral `0.5` on every trait is the default for a policy that
+/// predates identity, so behavior is unchanged until a policy opts in.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Personality {
+    /// Openness to experience: appetite for novelty and new interests.
+    #[serde(default = "default_trait")]
+    pub openness: f64,
+    /// Conscientiousness: discipline, routine adherence, focus.
+    #[serde(default = "default_trait")]
+    pub conscientiousness: f64,
+    /// Extraversion: activity level / sociability.
+    #[serde(default = "default_trait")]
+    pub extraversion: f64,
+    /// Agreeableness: gentle disposition; dampens conflict-adjacent salience.
+    #[serde(default = "default_trait")]
+    pub agreeableness: f64,
+    /// Neuroticism: emotional volatility (need-decay noise, boredom sensitivity).
+    #[serde(default = "default_trait")]
+    pub neuroticism: f64,
+}
+
+impl Default for Personality {
+    fn default() -> Self {
+        Self {
+            openness: default_trait(),
+            conscientiousness: default_trait(),
+            extraversion: default_trait(),
+            agreeableness: default_trait(),
+            neuroticism: default_trait(),
+        }
+    }
+}
+
+impl Personality {
+    /// Every trait as `(name, value)`, for validation and the CLI report.
+    pub fn as_pairs(&self) -> [(&'static str, f64); 5] {
+        [
+            ("openness", self.openness),
+            ("conscientiousness", self.conscientiousness),
+            ("extraversion", self.extraversion),
+            ("agreeableness", self.agreeableness),
+            ("neuroticism", self.neuroticism),
+        ]
+    }
+}
+
+fn default_trait() -> f64 {
+    0.5
+}
+
+/// An authored, character-consistent offline life event: a candidate stimulus
+/// the persona may notice (weighted by appraisal, not guaranteed). Modeled after
+/// Sims-style "whims": small, plausible, on-brand happenings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeEvent {
+    /// A short id for logging/dedup (e.g. `shed_roof_leak`).
+    pub id: String,
+    /// The event text, in third person, as it would appear in a memory
+    /// (e.g. "a neighbour mentions a model railway swap meet").
+    pub text: String,
+    /// The [`CategoryPool`] name this event is topically about, if any. Used by
+    /// appraisal's hard Venn gate: an event outside the allowed categories is
+    /// simply never noticed. `None` means it is need-only (no topical content).
+    #[serde(default)]
+    pub category: Option<String>,
+    /// A candidate topic seed this event may suggest for adoption, when noticed
+    /// and appraised as salient enough. Still blocklist- and Venn-gated before
+    /// ever entering the interest graph.
+    #[serde(default)]
+    pub suggests_seed: Option<String>,
+    /// The need this event is relevant to (e.g. `upkeep`), if any; feeds the
+    /// appraisal `need_pull` term.
+    #[serde(default)]
+    pub need: Option<String>,
+    /// Relative weight (>= 0) this event is drawn with; higher is more likely.
+    #[serde(default = "default_event_weight")]
+    pub weight: f64,
+}
+
+fn default_event_weight() -> f64 {
+    1.0
 }
 
 /// A life domain: a need/motive the persona services, and how it does so. A
@@ -493,6 +613,23 @@ pub enum PolicyIssue {
     DomainCategoryNotAllowed { domain: String, name: String },
     /// A domain's `online_bias` is outside `[0, 1]`.
     InvalidOnlineBias { domain: String },
+    /// A Big Five trait is outside `[0, 1]` (carries the trait name).
+    InvalidPersonalityTrait(&'static str),
+    /// A life event's id is empty.
+    EmptyLifeEventId,
+    /// A life event's text is empty (carries the event id).
+    EmptyLifeEventText(String),
+    /// A life event references a category that is not a known [`CategoryPool`].
+    LifeEventUnknownCategory { event: String, name: String },
+    /// A life event references a category that is a known [`CategoryPool`] but
+    /// not in `allowed_categories`; it could never pass appraisal's Venn gate,
+    /// so it would be authored dead content.
+    LifeEventCategoryNotAllowed { event: String, name: String },
+    /// A life event's `suggests_seed` is not blocklist-safe, so it could never
+    /// be adopted; authored content should not require a runtime skip.
+    LifeEventUnsafeSeed { event: String, seed: String },
+    /// A life event's `weight` is negative.
+    NegativeLifeEventWeight(String),
 }
 
 impl PersonaPolicy {
@@ -622,6 +759,50 @@ impl PersonaPolicy {
                 issues.push(PolicyIssue::InvalidOnlineBias {
                     domain: domain.name.clone(),
                 });
+            }
+        }
+
+        // Identity: every Big Five trait must be a probability.
+        for (name, value) in self.identity.personality.as_pairs() {
+            if !(0.0..=1.0).contains(&value) {
+                issues.push(PolicyIssue::InvalidPersonalityTrait(name));
+            }
+        }
+
+        // Life events: authored stimuli must themselves be well-formed and, when
+        // they suggest a seed, that seed must be blocklist-safe (an authored
+        // event should never be a candidate that can only ever be rejected).
+        let blocklist = crate::querybank::QueryBlocklist::bundled();
+        for event in &self.life_events {
+            if event.id.trim().is_empty() {
+                issues.push(PolicyIssue::EmptyLifeEventId);
+            }
+            if event.text.trim().is_empty() {
+                issues.push(PolicyIssue::EmptyLifeEventText(event.id.clone()));
+            }
+            if let Some(cat) = &event.category {
+                if CategoryPool::from_name(cat).is_none() {
+                    issues.push(PolicyIssue::LifeEventUnknownCategory {
+                        event: event.id.clone(),
+                        name: cat.clone(),
+                    });
+                } else if !self.allowed_categories.contains(cat) {
+                    issues.push(PolicyIssue::LifeEventCategoryNotAllowed {
+                        event: event.id.clone(),
+                        name: cat.clone(),
+                    });
+                }
+            }
+            if let Some(seed) = &event.suggests_seed {
+                if seed.trim().is_empty() || blocklist.is_blocked(seed) {
+                    issues.push(PolicyIssue::LifeEventUnsafeSeed {
+                        event: event.id.clone(),
+                        seed: seed.clone(),
+                    });
+                }
+            }
+            if event.weight < 0.0 {
+                issues.push(PolicyIssue::NegativeLifeEventWeight(event.id.clone()));
             }
         }
 
@@ -891,6 +1072,89 @@ categories = ["TECHNOLOGY"]
             .validate()
             .iter()
             .any(|i| matches!(i, PolicyIssue::InvalidOnlineBias { domain } if domain == "hobby")));
+        Ok(())
+    }
+
+    #[test]
+    fn default_identity_is_neutral_and_valid() -> crate::Result<()> {
+        let policy = PersonaPolicy::from_toml_str(minimal_toml())?;
+        for (_, v) in policy.identity.personality.as_pairs() {
+            assert!((v - 0.5).abs() < 1e-9);
+        }
+        assert!(policy.validate().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_range_personality_trait_is_flagged() -> crate::Result<()> {
+        let mut policy = PersonaPolicy::from_toml_str(minimal_toml())?;
+        policy.identity.personality.openness = 1.5;
+        policy.identity.personality.neuroticism = -0.2;
+        let issues = policy.validate();
+        assert!(issues
+            .iter()
+            .any(|i| matches!(i, PolicyIssue::InvalidPersonalityTrait("openness"))));
+        assert!(issues
+            .iter()
+            .any(|i| matches!(i, PolicyIssue::InvalidPersonalityTrait("neuroticism"))));
+        Ok(())
+    }
+
+    #[test]
+    fn life_event_category_not_in_allowed_set_is_flagged() -> crate::Result<()> {
+        let mut policy = PersonaPolicy::from_toml_str(minimal_toml())?;
+        policy.life_events.push(LifeEvent {
+            id: "e1".to_string(),
+            text: "something happens".to_string(),
+            category: Some("FINANCE".to_string()), // not in minimal_toml's allowed set
+            suggests_seed: None,
+            need: None,
+            weight: 1.0,
+        });
+        assert!(policy.validate().iter().any(|i| matches!(
+            i,
+            PolicyIssue::LifeEventCategoryNotAllowed { event, name }
+                if event == "e1" && name == "FINANCE"
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn life_event_unsafe_seed_is_flagged() -> crate::Result<()> {
+        let mut policy = PersonaPolicy::from_toml_str(minimal_toml())?;
+        policy.life_events.push(LifeEvent {
+            id: "e2".to_string(),
+            text: "something happens".to_string(),
+            category: Some("TECHNOLOGY".to_string()),
+            suggests_seed: Some("call 988 now".to_string()),
+            need: None,
+            weight: 1.0,
+        });
+        assert!(policy
+            .validate()
+            .iter()
+            .any(|i| matches!(i, PolicyIssue::LifeEventUnsafeSeed { event, .. } if event == "e2")));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_life_event_id_and_text_are_flagged() -> crate::Result<()> {
+        let mut policy = PersonaPolicy::from_toml_str(minimal_toml())?;
+        policy.life_events.push(LifeEvent {
+            id: "".to_string(),
+            text: "  ".to_string(),
+            category: None,
+            suggests_seed: None,
+            need: None,
+            weight: 1.0,
+        });
+        let issues = policy.validate();
+        assert!(issues
+            .iter()
+            .any(|i| matches!(i, PolicyIssue::EmptyLifeEventId)));
+        assert!(issues
+            .iter()
+            .any(|i| matches!(i, PolicyIssue::EmptyLifeEventText(id) if id.is_empty())));
         Ok(())
     }
 
