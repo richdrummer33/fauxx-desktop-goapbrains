@@ -33,29 +33,38 @@
 //!
 //! Run it with:  `cargo run -p fauxx-core --example day_in_the_life`
 
+// -----------------------------------------------------------------------------
+
+// PATCHED for a live LM Studio sidecar. Diff against the original at
+// crates/fauxx-core/examples/day_in_the_life.rs on branch
+// claude/fauxx-persona-engine-mvp-2cchmv. Everything else is untouched;
+// changes are marked "--- LLM PATCH ---".
+//
+// Run it (PowerShell):
+//   $env:FAUXX_LLM = "1"
+//   $env:FAUXX_LLM_ENDPOINT = "169.254.83.107:1234"   # your LM Studio server
+//   $env:FAUXX_LLM_MODEL = "phi-4-mini-3.8b-instruct"  # exact /v1/models id - verify!
+//   $env:FAUXX_SIM_DAYS = "7"                          # 7 = a week, 30 = a month
+//   cargo run -p fauxx-core --example day_in_the_life
+//
+// Omit FAUXX_LLM (or set it to "0") to get the original deterministic-only run.
+
 use std::error::Error;
 
 use fauxx_core::persona_engine::world::InterestSource;
 use fauxx_core::persona_engine::{builtins, plan_tick};
+// --- LLM PATCH: pull in the sidecar types instead of only DisabledAssistant ---
+use fauxx_core::persona_engine::{LlmConfig, LmStudioAssistant, LmStudioTransport, SemanticAssistant};
 use fauxx_core::{BehaviorState, DisabledAssistant, SafetyGate};
 
-/// Weekday name for a UTC day index (Unix day 0 was a Thursday; Monday = 0).
 fn day_name(day_index: i64) -> &'static str {
     let names = [
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-        "Sunday",
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
     ];
-    // Unix day 0 was a Thursday; shift so the array (Monday first) lines up.
     let dow = (day_index + 3).rem_euclid(7) as usize;
     names[dow.min(6)]
 }
 
-/// A tiny single-char energy meter.
 fn energy_bar(e: f64) -> char {
     let bars = [
         '\u{2581}', '\u{2582}', '\u{2583}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
@@ -64,12 +73,41 @@ fn energy_bar(e: f64) -> char {
     bars[idx]
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+// --- LLM PATCH: build the sidecar from env vars, boxed to a common trait
+// object so the rest of main() doesn't care which concrete type it got. ---
+fn build_sidecar_from_env() -> Box<dyn SemanticAssistant> {
+    let enabled = std::env::var("FAUXX_LLM").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    if !enabled {
+        return Box::new(DisabledAssistant);
+    }
+    let endpoint = std::env::var("FAUXX_LLM_ENDPOINT").unwrap_or_else(|_| "127.0.0.1:1234".to_string());
+    let model = std::env::var("FAUXX_LLM_MODEL").unwrap_or_else(|_| "local-model".to_string());
+    let timeout_ms = std::env::var("FAUXX_LLM_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4_000);
+    eprintln!("[llm sidecar] enabled, endpoint={endpoint}, model={model}");
+    let config = LlmConfig { enabled: true, endpoint, model, timeout_ms };
+    let transport = LmStudioTransport::new(&config);
+    Box::new(LmStudioAssistant::new(config, transport))
+}
+
+// --- LLM PATCH: main is now async, on a multi-thread runtime, so
+// LmStudioAssistant's block_in_place/block_on sync bridge has a Handle to
+// find. rt-multi-thread + macros are already in the workspace's shared tokio
+// feature set (root Cargo.toml), so no Cargo.toml edit is needed. ---
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<(), Box<dyn Error>> {
     let policy = builtins::get("elias_rickensworth")?;
     let gate = SafetyGate::new();
-    let sidecar = DisabledAssistant;
+    let sidecar = build_sidecar_from_env(); // --- LLM PATCH (was: let sidecar = DisabledAssistant;)
     let mut state = BehaviorState::new(&policy.id);
     let daily_cap = policy.action_budget.max_actions_per_day;
+
+    // --- LLM PATCH: configurable day range (env, default keeps the original 10-day run) ---
+    let start_day: i64 = std::env::var("FAUXX_SIM_START_DAY").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let num_days: i64 = std::env::var("FAUXX_SIM_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let end_day = start_day + num_days - 1;
 
     println!(
         "A few days in the life of {} (dry simulation: no network, no browser)\n",
@@ -86,24 +124,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("Legend:  HH:00  <energy>  <routine>   category / topic  ->  queries\n");
 
-    // A week and a half, so a discovered interest (which starts weak) has a
-    // real chance to be reinforced and surface in a later session.
-    for day in 2..=11i64 {
+    for day in start_day..=end_day {
         println!("---- {} ----", day_name(day));
         let mut did_something = false;
         let mut budget_noted = false;
 
         for hour in 6..=22u8 {
             let now = day * 86_400_000 + (hour as i64) * 3_600_000;
-            // A per-tick seed so each hour makes its own draws, but the run stays
-            // reproducible.
             let seed = 0xE1A5_u64 ^ ((day as u64) << 8) ^ (hour as u64);
-            let report = plan_tick(&policy, &mut state, &sidecar, &gate, now, seed);
+            // --- LLM PATCH: pass the trait object by reference ---
+            let report = plan_tick(&policy, &mut state, sidecar.as_ref(), &gate, now, seed);
             let energy = energy_bar(report.behavior_state.energy);
 
-            // Sense: something may have happened, whether or not he was in an
-            // active routine. Only print it when he actually NOTICED it (below
-            // the notice threshold, it leaves no trace, same as real life).
             if let Some(sensed) = &report.sensed {
                 if sensed.noticed {
                     match &sensed.adopted_seed {
@@ -117,13 +149,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
-            // Quiet hours (no routine): Elias potters about; keep the log sparse.
             let Some(routine) = report.current_routine.clone() else {
                 continue;
             };
 
-            // OFFLINE action: he attends to a need in the real world. Nothing on
-            // the wire. The harness plays the executor and satisfies the need.
             if let Some(goal) = report.selected_goal.as_ref().filter(|g| !g.online) {
                 let amount = policy
                     .domain_by_need(&goal.need)
@@ -139,13 +168,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
 
-            // An active window but the goal layer chose to skip (anti-coherence).
             if report.idle || report.final_plan.is_empty() {
                 println!("{hour:02}:00  {energy}  {routine:<16} (idle: nothing catches his eye)");
                 continue;
             }
 
-            // Respect the soft daily decoy budget (the executor's job).
             if report.behavior_state.actions_today >= daily_cap {
                 if !budget_noted {
                     println!(
@@ -156,8 +183,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
 
-            // ONLINE action: record each approved query so momentum + cooldowns
-            // evolve, and satisfy the serviced need.
             let goal = match &report.selected_goal {
                 Some(g) => g,
                 None => continue,
@@ -179,9 +204,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .subcategory
                 .as_deref()
                 .unwrap_or(goal.category.as_str());
-            // Flag when the pursued topic is a DISCOVERED interest (adopted
-            // from a noticed life event), not one of Elias's original seeds -
-            // this is specialization actually showing up in his behavior.
             let discovered = state
                 .world
                 .interests
@@ -200,7 +222,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         if !did_something {
             println!("(a quiet day; Elias mostly watched the barometer)");
         }
-        // What is Elias into at day's end?
         let mut scores: Vec<(&String, &f64)> = state.topic_scores.iter().collect();
         scores.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
         let top: Vec<String> = scores
@@ -244,9 +265,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!(
         "(Every query above passed the Safety Gate. The deterministic control layer \n\
-         chose all of it; the LLM sidecar was disabled the whole time. What he noticed \n\
-         and adopted came only from authored, character-consistent life events - never \n\
-         from anything outside his allowed categories.)"
+         chose the routine, need, category and topic; the LLM sidecar (when enabled) only \n\
+         phrased/appraised within that already-approved choice, and every candidate is still \n\
+         blocklist- and Safety-Gate-checked before being shown. No network call, no browser.)"
     );
     Ok(())
 }
