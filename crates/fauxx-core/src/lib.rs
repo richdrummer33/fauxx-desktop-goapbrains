@@ -3229,13 +3229,15 @@ impl Core {
 
     /// Compute a DRY-RUN planning report for `policy`: advance a copy of any
     /// persisted behavior state, select a goal, plan candidate intents, and run
-    /// the Safety Gate. Pure: it does NOT persist the advanced state and performs
-    /// NO network call (even with `llm` enabled: LM Studio runs on loopback, not
-    /// the open internet, and a dry-run's sensing step is the only thing that
-    /// might consult it). `now` is epoch millis; `seed` makes the pass
-    /// reproducible. `llm` is the optional local LLM sidecar config; `None` (or
-    /// a config with `enabled: false`) uses the deterministic-only
-    /// [`DisabledAssistant`].
+    /// the Safety Gate. It never drives the decoy browser and never persists the
+    /// advanced state. `now` is epoch millis; `seed` makes the pass reproducible.
+    /// `llm` is the optional local LLM sidecar config; `None` (or a config with
+    /// `enabled: false`) uses the deterministic-only [`DisabledAssistant`] and
+    /// makes no network call at all. With `llm` enabled, this is NOT
+    /// network-free: sensing/appraisal (and, on a day boundary, reflection) may
+    /// make a real loopback HTTP call to the configured LM Studio endpoint. See
+    /// [`DryRunReport::no_network`](persona_engine::DryRunReport::no_network),
+    /// which reflects this honestly rather than asserting a blanket guarantee.
     pub async fn persona_engine_plan(
         &self,
         policy: &PersonaPolicy,

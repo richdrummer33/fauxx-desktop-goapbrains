@@ -20,7 +20,8 @@
 //! A thin shim over the core's persona-engine API. `list`/`show`/`validate` are
 //! pure and never open the store; `plan`/`run-once`/`logs` open the core so the
 //! persona's behavior state and activity log persist. `plan` (and `run-once
-//! --dry-run`) perform no network call and no store write.
+//! --dry-run`) never drive the browser and never write to the store; they are
+//! only network-free when `--llm` is not passed (see `report.no_network`).
 
 use std::path::{Path, PathBuf};
 
@@ -47,8 +48,9 @@ pub async fn run(config: Config, command: PersonaEngineCommand) -> anyhow::Resul
             llm,
             llm_endpoint,
             llm_model,
+            llm_api_key,
         } => {
-            let llm_config = llm_config_from_flags(llm, llm_endpoint, llm_model);
+            let llm_config = llm_config_from_flags(llm, llm_endpoint, llm_model, llm_api_key);
             plan(config, &persona, seed, now, json, llm_config).await
         }
         PersonaEngineCommand::RunOnce {
@@ -61,8 +63,9 @@ pub async fn run(config: Config, command: PersonaEngineCommand) -> anyhow::Resul
             llm,
             llm_endpoint,
             llm_model,
+            llm_api_key,
         } => {
-            let llm_config = llm_config_from_flags(llm, llm_endpoint, llm_model);
+            let llm_config = llm_config_from_flags(llm, llm_endpoint, llm_model, llm_api_key);
             run_once(
                 config, &persona, dry_run, decoy_id, seed, now, json, llm_config,
             )
@@ -222,9 +225,15 @@ async fn run_once(
     Ok(())
 }
 
-/// Build an [`LlmConfig`] from the CLI's `--llm`/`--llm-endpoint`/`--llm-model`
-/// flags, or `None` when `--llm` was not passed (the deterministic-only path).
-fn llm_config_from_flags(enabled: bool, endpoint: String, model: String) -> Option<LlmConfig> {
+/// Build an [`LlmConfig`] from the CLI's `--llm`/`--llm-endpoint`/`--llm-model`/
+/// `--llm-api-key` flags, or `None` when `--llm` was not passed (the
+/// deterministic-only path).
+fn llm_config_from_flags(
+    enabled: bool,
+    endpoint: String,
+    model: String,
+    api_key: Option<String>,
+) -> Option<LlmConfig> {
     if !enabled {
         return None;
     }
@@ -232,6 +241,7 @@ fn llm_config_from_flags(enabled: bool, endpoint: String, model: String) -> Opti
         enabled: true,
         endpoint,
         model,
+        api_key,
         ..LlmConfig::default()
     })
 }

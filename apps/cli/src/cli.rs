@@ -1004,7 +1004,9 @@ pub enum PersonaEngineCommand {
 
     /// Dry-run the decision pipeline for a persona: show the routine, behavior
     /// state, goal/utility scores, candidate intents, safety decision, and final
-    /// plan. Performs NO network call and NO store write.
+    /// plan. Never drives the browser or writes to the store. Network-free UNLESS
+    /// `--llm` is passed, in which case sensing/appraisal may call out to the
+    /// local LLM server (see the report's `no_network` field).
     Plan {
         /// The persona policy id (or a .toml path).
         #[arg(long)]
@@ -1032,6 +1034,10 @@ pub enum PersonaEngineCommand {
         /// The model id LM Studio has loaded (only used with `--llm`).
         #[arg(long, default_value = "local-model")]
         llm_model: String,
+        /// Bearer token for an LM Studio server with "Require Authentication"
+        /// enabled (only used with `--llm`; omit for the unauthenticated default).
+        #[arg(long, value_name = "TOKEN")]
+        llm_api_key: Option<String>,
     },
 
     /// Run ONE tick for a persona. With `--dry-run` this is exactly `plan`.
@@ -1067,6 +1073,10 @@ pub enum PersonaEngineCommand {
         /// The model id LM Studio has loaded (only used with `--llm`).
         #[arg(long, default_value = "local-model")]
         llm_model: String,
+        /// Bearer token for an LM Studio server with "Require Authentication"
+        /// enabled (only used with `--llm`; omit for the unauthenticated default).
+        #[arg(long, value_name = "TOKEN")]
+        llm_api_key: Option<String>,
     },
 
     /// Decoy activity logs for a persona.

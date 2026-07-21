@@ -108,9 +108,12 @@ impl PolicySummary {
 /// so the operator can see exactly how a decision was reached, and it is
 /// serializable for `--json`.
 ///
-/// A dry-run that produces this report performs NO network calls and NO store
-/// writes; the `no_network` flag is always `true` here as a machine-checkable
-/// assertion of that contract.
+/// A dry-run never drives the decoy browser and never persists anything, but
+/// [`no_network`](Self::no_network) is NOT hardcoded `true`: with the optional
+/// LLM sidecar enabled, sensing/appraising a stimulus (and, on a day
+/// boundary, reflection) MAY make a real loopback HTTP call to the local LLM
+/// server. `no_network` reflects that honestly (`!sidecar.is_enabled()`)
+/// rather than asserting a guarantee the sidecar can break.
 #[derive(Debug, Clone, Serialize)]
 pub struct DryRunReport {
     /// The persona policy id.
@@ -134,7 +137,12 @@ pub struct DryRunReport {
     pub selected_goal: Option<DecoyGoal>,
     /// The candidate intents the planner produced (empty when idle).
     pub candidate_intents: Vec<Intent>,
-    /// Whether the LLM sidecar was consulted (MVP: always `false`).
+    /// Whether the planner's query generation actually used the LLM sidecar
+    /// this tick (`false` whenever the sidecar is disabled; also `false` on a
+    /// tick where the deterministic fallback was used anyway). This does NOT
+    /// cover the sense/appraisal or reflection seams; see
+    /// [`no_network`](Self::no_network) for whether ANY sidecar call could
+    /// have happened this tick.
     pub sidecar_used: bool,
     /// The Safety Gate decision for each candidate intent.
     pub safety_decisions: Vec<SafetyDecision>,
@@ -143,7 +151,12 @@ pub struct DryRunReport {
     /// A jittered suggestion for how long (seconds) until the persona's next
     /// action, so a driver can schedule non-metronomic cadence.
     pub suggested_next_delay_seconds: u64,
-    /// Always `true` for a dry-run: no network call was performed.
+    /// `true` only when the LLM sidecar was disabled for this tick, so no
+    /// loopback network call could have happened anywhere in the pipeline
+    /// (sensing, appraisal, reflection, or query generation). `false`
+    /// whenever the sidecar is enabled, even if it happened not to be
+    /// consulted this particular tick: a dry-run with `--llm` is NOT
+    /// guaranteed network-free.
     pub no_network: bool,
 }
 
@@ -182,9 +195,12 @@ pub struct PersonaEngineRunOutcome {
 /// event, appraise it, and ingest it into the world-model if noticed), select a
 /// goal, plan candidate intents (deterministic fallback unless the sidecar is
 /// enabled and valid), run the Safety Gate, and truncate the approved plan to
-/// the policy's per-run action budget. Pure: mutates only `state`, performs no
-/// I/O and no network (the sense step is itself a local computation over
-/// authored `[[life_events]]`, never a real observation of the outside world).
+/// the policy's per-run action budget. Mutates only `state` and drives no
+/// browser or store I/O; the offline life event itself is a local computation
+/// over authored `[[life_events]]`, never a real observation of the outside
+/// world. It is NOT network-free when `sidecar` is an enabled LLM assistant:
+/// appraisal, and on a day boundary reflection, may consult it over loopback.
+/// See [`DryRunReport::no_network`].
 pub fn plan_tick(
     policy: &PersonaPolicy,
     state: &mut BehaviorState,
@@ -263,7 +279,7 @@ pub fn plan_tick(
         safety_decisions: Vec::new(),
         final_plan: Vec::new(),
         suggested_next_delay_seconds: next_delay,
-        no_network: true,
+        no_network: !sidecar.is_enabled(),
     };
 
     let Some(goal) = selection.goal else {

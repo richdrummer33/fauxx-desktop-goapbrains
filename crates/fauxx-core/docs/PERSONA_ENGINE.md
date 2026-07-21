@@ -231,7 +231,14 @@ Rules enforced in code:
   endpoint on loopback, e.g. `127.0.0.1:1234`) over plain HTTP. There is no cloud
   provider, no bundled model, and no config path that reaches a non-loopback host
   by default; enabling it is an explicit `--llm` opt-in (`LlmConfig { enabled:
-  true, .. }` at the API level).
+  true, .. }` at the API level). Response framing parses the `Content-Length`
+  header rather than waiting for the peer to close the connection: LM Studio's
+  server has been observed to keep connections open (`Connection: keep-alive`)
+  even when the client sends `Connection: close`, which would otherwise make
+  every real call block for the full request timeout. An optional
+  `LlmConfig::api_key` (`--llm-api-key`) is sent as `Authorization: Bearer
+  <token>` for a server with LM Studio's "Require Authentication" setting on;
+  it is omitted entirely against the (default) unauthenticated server.
 - Schema-validated output. Anything the sidecar returns is length/scope checked
   and then re-gated by the harmful-query blocklist and the Safety Gate. A
   proposed sub-interest must also name a category the persona is actually
@@ -255,12 +262,16 @@ Rules enforced in code:
 ## Dry-run mode
 
 `persona-engine plan` (and `run-once --dry-run`) run the whole pipeline and print
-the decision without touching the network or writing to the store. The report
+the decision without driving the browser or writing to the store. The report
 shows the persona id, the current routine, the behavior state (energy, curiosity,
 boredom, topic scores), the goal/utility scores, the selected goal, the action
 type, the category and subcategory, the candidate intents, whether the sidecar
-was used, the safety decision per intent, the final approved plan, and an
-explicit `no_network: true` line.
+was used, the safety decision per intent, the final approved plan, and a
+`no_network` line. Without `--llm` (the default) this is always `true`: a
+dry-run genuinely touches no network. With `--llm` enabled, `no_network` is
+`false`: sensing/appraisal (and, on a day boundary, reflection) may make a
+real loopback HTTP call to the local LM Studio endpoint, so `--llm` on `plan`
+is a way to preview the sidecar's effect, not a network-free operation.
 
 ## Safety gates
 
@@ -291,12 +302,19 @@ fauxx-cli persona-engine logs export --persona elias_rickensworth --format jsonl
 # default; requires an LM Studio server already running and listening locally.
 fauxx-cli persona-engine plan --persona elias_rickensworth --dry-run \
     --llm --llm-endpoint 127.0.0.1:1234 --llm-model local-model
+
+# If the LM Studio server has "Require Authentication" enabled (Developer ->
+# Server Settings, LM Studio 0.4+), pass its bearer token:
+fauxx-cli persona-engine plan --persona elias_rickensworth --dry-run \
+    --llm --llm-api-key "$LM_STUDIO_TOKEN"
 ```
 
 `--seed` makes a pass reproducible and `--now <epoch-millis>` overrides the clock,
 so a run is fully deterministic for tests and scripted schedules. `--llm` is
-available on both `plan` and `run-once`; `--llm-endpoint`/`--llm-model` are
-ignored unless `--llm` is also passed.
+available on both `plan` and `run-once`; `--llm-endpoint`/`--llm-model`/
+`--llm-api-key` are ignored unless `--llm` is also passed. `plan --llm` is a
+way to preview the sidecar's effect, not a network-free operation: see
+"Dry-run mode" above.
 
 ## Example dry-run output
 

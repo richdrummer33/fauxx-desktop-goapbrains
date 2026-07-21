@@ -28,9 +28,16 @@
 //! than pull in a full HTTP client crate, [`LmStudioTransport`] speaks just
 //! enough HTTP/1.1 by hand over a `tokio::net::TcpStream`, matching the house
 //! preference for dependency-light infrastructure. It sends `Connection:
-//! close` and reads the socket to EOF, which keeps response parsing simple
-//! (no chunked-transfer-encoding handling) at the cost of not reusing
-//! connections; fine for the low, human-paced call volume this sidecar makes.
+//! close`, but does NOT rely on the peer actually closing the socket to know
+//! the response is complete: LM Studio's local server has been observed to
+//! keep connections open (`Connection: keep-alive`, a several-second idle
+//! timeout) regardless of what the client requests, which would make a naive
+//! read-to-EOF client block for the full request timeout on every call. The
+//! read loop instead parses the response's `Content-Length` header and stops
+//! as soon as that many body bytes have arrived, falling back to read-to-EOF
+//! only if no `Content-Length` is present (e.g. a chunked response), which
+//! keeps the common case fast and correct without adding chunked-encoding
+//! support.
 //!
 //! # Sync bridge
 //!
@@ -72,6 +79,12 @@ pub struct LlmConfig {
     /// Per-request timeout. A timeout is treated exactly like any other
     /// failure: the deterministic fallback is used.
     pub timeout_ms: u64,
+    /// Bearer token to send as `Authorization: Bearer <token>`, for an LM
+    /// Studio server with its optional "Require Authentication" server
+    /// setting turned on (LM Studio 0.4+). `None` (the default) sends no
+    /// `Authorization` header at all, which is what an unauthenticated local
+    /// server (LM Studio's own default) expects.
+    pub api_key: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -81,6 +94,7 @@ impl Default for LlmConfig {
             endpoint: "127.0.0.1:1234".to_string(),
             model: "local-model".to_string(),
             timeout_ms: 4_000,
+            api_key: None,
         }
     }
 }
@@ -101,6 +115,7 @@ pub trait LlmTransport: Send + Sync {
 pub struct LmStudioTransport {
     endpoint: String,
     model: String,
+    api_key: Option<String>,
     timeout: Duration,
 }
 
@@ -111,9 +126,98 @@ impl LmStudioTransport {
         Self {
             endpoint: config.endpoint.clone(),
             model: config.model.clone(),
+            api_key: config.api_key.clone(),
             timeout: Duration::from_millis(config.timeout_ms),
         }
     }
+}
+
+/// The maximum number of header bytes read while looking for the `\r\n\r\n`
+/// separator, before giving up. A guard against an endless or malicious
+/// response, not a real-world limit (LM Studio's headers are tiny).
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+/// The maximum total response size (headers + body) accepted. `max_tokens` is
+/// bounded to 200 per request, so a real reply is a few KB at most; this is a
+/// guard against an endless stream on a connection that never closes.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read one HTTP/1.1 response from `stream`: read until the header block is
+/// complete, then read exactly `Content-Length` more body bytes (falling back
+/// to reading until EOF if no `Content-Length` header is present, e.g. a
+/// chunked response). Does NOT wait for the peer to close the connection,
+/// which LM Studio's server may not do promptly even after `Connection:
+/// close` (see the module doc).
+async fn read_http_response(stream: &mut TcpStream) -> Result<String, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    let header_end = loop {
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            break pos;
+        }
+        if buf.len() > MAX_HEADER_BYTES {
+            return Err("response headers exceeded the size limit".to_string());
+        }
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|e| format!("read response headers: {e}"))?;
+        if n == 0 {
+            return Err("connection closed before headers completed".to_string());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    let header_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let content_length = header_text.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    });
+    let body_start = header_end + 4;
+
+    match content_length {
+        Some(len) => {
+            let target = body_start
+                .saturating_add(len)
+                .min(body_start.saturating_add(MAX_RESPONSE_BYTES));
+            while buf.len() < target {
+                let n = stream
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|e| format!("read response body: {e}"))?;
+                if n == 0 {
+                    break; // peer closed early; return whatever body arrived.
+                }
+                let take = n.min(target - buf.len());
+                buf.extend_from_slice(&chunk[..take]);
+            }
+        }
+        None => loop {
+            if buf.len() > MAX_RESPONSE_BYTES {
+                return Err("response body exceeded the size limit".to_string());
+            }
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| format!("read response body: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        },
+    }
+
+    String::from_utf8(buf).map_err(|e| format!("response is not UTF-8: {e}"))
+}
+
+/// The byte offset of the first occurrence of `needle` in `haystack`, if any.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,21 +246,24 @@ impl LlmTransport for LmStudioTransport {
             ],
             "temperature": 0.2,
             "max_tokens": 200,
+            "stream": false,
         })
         .to_string();
 
-        let http_request = format!(
+        let mut headers = format!(
             "POST /v1/chat/completions HTTP/1.1\r\n\
              Host: {host}\r\n\
              Content-Type: application/json\r\n\
              Content-Length: {len}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {body}",
+             Connection: close\r\n",
             host = self.endpoint,
             len = request_body.len(),
-            body = request_body,
         );
+        if let Some(key) = &self.api_key {
+            headers.push_str(&format!("Authorization: Bearer {key}\r\n"));
+        }
+        headers.push_str("\r\n");
+        let http_request = format!("{headers}{request_body}");
 
         let call = async {
             let mut stream = TcpStream::connect(&self.endpoint)
@@ -166,12 +273,7 @@ impl LlmTransport for LmStudioTransport {
                 .write_all(http_request.as_bytes())
                 .await
                 .map_err(|e| format!("write request: {e}"))?;
-            let mut raw = Vec::new();
-            stream
-                .read_to_end(&mut raw)
-                .await
-                .map_err(|e| format!("read response: {e}"))?;
-            String::from_utf8(raw).map_err(|e| format!("response is not UTF-8: {e}"))
+            read_http_response(&mut stream).await
         };
 
         let raw_response = tokio::time::timeout(self.timeout, call)
@@ -454,6 +556,7 @@ mod tests {
             endpoint: addr.to_string(),
             model: "test-model".to_string(),
             timeout_ms: 2_000,
+            api_key: None,
         };
         let transport = LmStudioTransport::new(&config);
         let reply = transport.chat("system", "user").await;
@@ -461,6 +564,64 @@ mod tests {
             panic!("server task failed: {e}");
         }
         assert_eq!(reply, Ok("mercury barometer tube replacement".to_string()));
+    }
+
+    /// Reproduces LM Studio's observed real-world behavior: the server does
+    /// NOT necessarily close the socket after responding, even though the
+    /// client sent `Connection: close` (it has been seen replying
+    /// `Connection: keep-alive` with a several-second idle timeout). A client
+    /// that waited for EOF to know the response was complete would block for
+    /// the full request timeout on every single call. The `Content-Length`
+    /// based reader must return as soon as the body has fully arrived,
+    /// regardless of whether the peer ever closes the connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lmstudio_transport_returns_promptly_when_the_peer_holds_the_connection_open() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => panic!("failed to bind loopback listener: {e}"),
+        };
+        let addr = match listener.local_addr() {
+            Ok(a) => a,
+            Err(e) => panic!("failed to read local addr: {e}"),
+        };
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => panic!("failed to accept loopback connection: {e}"),
+            };
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = chat_json("mercury barometer tube replacement");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            // Deliberately hold the socket open well past the client's
+            // timeout instead of closing it, simulating an uncooperative
+            // keep-alive server.
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+        });
+
+        let config = LlmConfig {
+            enabled: true,
+            endpoint: addr.to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 400,
+            api_key: None,
+        };
+        let transport = LmStudioTransport::new(&config);
+        let started = std::time::Instant::now();
+        let reply = transport.chat("system", "user").await;
+        let elapsed = started.elapsed();
+        assert_eq!(reply, Ok("mercury barometer tube replacement".to_string()));
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "expected a prompt return well under the timeout, took {elapsed:?}"
+        );
+        let _ = server.await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -471,9 +632,58 @@ mod tests {
             endpoint: "127.0.0.1:1".to_string(), // reserved, nothing listens
             model: "test-model".to_string(),
             timeout_ms: 500,
+            api_key: None,
         };
         let transport = LmStudioTransport::new(&config);
         assert!(transport.chat("system", "user").await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lmstudio_transport_sends_the_bearer_token_when_configured() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => panic!("failed to bind loopback listener: {e}"),
+        };
+        let addr = match listener.local_addr() {
+            Ok(a) => a,
+            Err(e) => panic!("failed to read local addr: {e}"),
+        };
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => panic!("failed to accept loopback connection: {e}"),
+            };
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let body = chat_json(if request.contains("Authorization: Bearer secret-token") {
+                "authorized"
+            } else {
+                "unauthorized"
+            });
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let config = LlmConfig {
+            enabled: true,
+            endpoint: addr.to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 2_000,
+            api_key: Some("secret-token".to_string()),
+        };
+        let transport = LmStudioTransport::new(&config);
+        let reply = transport.chat("system", "user").await;
+        if let Err(e) = server.await {
+            panic!("server task failed: {e}");
+        }
+        assert_eq!(reply, Ok("authorized".to_string()));
     }
 
     // --- LmStudioAssistant, via MockTransport (no network) ---
