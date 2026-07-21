@@ -1516,6 +1516,91 @@ impl EncryptedStore {
             .execute("DELETE FROM campaigns WHERE id = ?1", [id])?;
         Ok(affected > 0)
     }
+
+    /// Insert or replace the persona-engine behavior state for a persona policy,
+    /// keyed on its policy id. The full [`BehaviorState`](crate::persona_engine::BehaviorState)
+    /// JSON is stored verbatim so the persona's momentum/cooldowns survive restart.
+    pub fn upsert_persona_engine_state(
+        &self,
+        state: &crate::persona_engine::BehaviorState,
+    ) -> Result<()> {
+        let json = serde_json::to_string(state)?;
+        self.conn.execute(
+            "INSERT INTO persona_engine_state (persona_id, json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(persona_id) DO UPDATE SET
+                 json = excluded.json,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![state.persona_id, json, state.last_updated],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch a persona's behavior state, or `None` if none is stored yet.
+    pub fn get_persona_engine_state(
+        &self,
+        persona_id: &str,
+    ) -> Result<Option<crate::persona_engine::BehaviorState>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT json FROM persona_engine_state WHERE persona_id = ?1",
+                [persona_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match json {
+            Some(j) => Ok(Some(serde_json::from_str(&j)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Append one decoy-activity record to the persona-engine activity log. The
+    /// full [`ActivityRecord`](crate::persona_engine::ActivityRecord) JSON is
+    /// stored verbatim (decoy-only; no secrets).
+    pub fn append_persona_engine_activity(
+        &self,
+        record: &crate::persona_engine::ActivityRecord,
+    ) -> Result<()> {
+        let json = serde_json::to_string(record)?;
+        self.conn.execute(
+            "INSERT INTO persona_engine_activity (persona_id, recorded_at, json)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![record.persona_id, record.timestamp, json],
+        )?;
+        Ok(())
+    }
+
+    /// List persona-engine activity records, oldest first (chronological, for a
+    /// readable JSONL export). Scoped to `persona_id` when `Some`; else all.
+    pub fn list_persona_engine_activity(
+        &self,
+        persona_id: Option<&str>,
+    ) -> Result<Vec<crate::persona_engine::ActivityRecord>> {
+        let mut out = Vec::new();
+        match persona_id {
+            Some(pid) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT json FROM persona_engine_activity
+                     WHERE persona_id = ?1 ORDER BY recorded_at ASC, id ASC",
+                )?;
+                let rows = stmt.query_map([pid], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    out.push(serde_json::from_str(&row?)?);
+                }
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT json FROM persona_engine_activity ORDER BY recorded_at ASC, id ASC",
+                )?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    out.push(serde_json::from_str(&row?)?);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Current wall-clock time in epoch milliseconds (0 if the clock predates the
@@ -2368,6 +2453,71 @@ mod tests {
         let all = store.list_device_ips()?;
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].1.as_deref(), Some("203.0.113.7"));
+        Ok(())
+    }
+
+    #[test]
+    fn persona_engine_state_round_trips_and_upserts() -> Result<()> {
+        let dir = tempdir()?;
+        let store =
+            EncryptedStore::open_at(&dir.path().join("fauxx.db"), &passphrase_source(dir.path()))?;
+
+        assert_eq!(store.get_persona_engine_state("elias")?, None);
+
+        let mut state = crate::persona_engine::BehaviorState::new("elias");
+        state.last_updated = 1_700_000_000_000;
+        state.curiosity = 0.42;
+        state.topic_scores.insert("CRAFTS".to_string(), 1.5);
+        store.upsert_persona_engine_state(&state)?;
+        assert_eq!(
+            store.get_persona_engine_state("elias")?,
+            Some(state.clone())
+        );
+
+        // Upsert replaces in place (keyed on persona id).
+        state.curiosity = 0.9;
+        store.upsert_persona_engine_state(&state)?;
+        let back = store.get_persona_engine_state("elias")?;
+        assert_eq!(back.map(|s| s.curiosity), Some(0.9));
+        Ok(())
+    }
+
+    #[test]
+    fn persona_engine_activity_appends_and_scopes_by_persona() -> Result<()> {
+        let dir = tempdir()?;
+        let store =
+            EncryptedStore::open_at(&dir.path().join("fauxx.db"), &passphrase_source(dir.path()))?;
+
+        let rec = |pid: &str, ts: i64| crate::persona_engine::ActivityRecord {
+            timestamp: ts,
+            persona_id: pid.to_string(),
+            policy_version: 1,
+            routine: Some("weekday_evening".to_string()),
+            goal: "browse_hobby:g".to_string(),
+            action_type: "search".to_string(),
+            category: "CRAFTS".to_string(),
+            query_seed: "fountain pens".to_string(),
+            final_query: Some("blue black ink".to_string()),
+            target_domain: Some("duckduckgo".to_string()),
+            dwell_seconds: None,
+            egress_mode: "direct".to_string(),
+            safety_outcome: "allowed".to_string(),
+            executor_result: "dispatched".to_string(),
+            error: None,
+            reason: "elias browses pens".to_string(),
+        };
+        store.append_persona_engine_activity(&rec("elias", 100))?;
+        store.append_persona_engine_activity(&rec("elias", 50))?;
+        store.append_persona_engine_activity(&rec("other", 75))?;
+
+        let elias = store.list_persona_engine_activity(Some("elias"))?;
+        assert_eq!(elias.len(), 2);
+        // Chronological (oldest first).
+        assert_eq!(elias[0].timestamp, 50);
+        assert_eq!(elias[1].timestamp, 100);
+
+        let all = store.list_persona_engine_activity(None)?;
+        assert_eq!(all.len(), 3);
         Ok(())
     }
 }

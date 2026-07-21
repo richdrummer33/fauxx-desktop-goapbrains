@@ -1,0 +1,320 @@
+# Elias Rickensworth: the first built-in decoy persona.
+#
+# Elias is a FICTIONAL, harmless, oddly specific benign hobbyist. He does not
+# impersonate any real person. His whole job is to emit boring, plausible decoy
+# search/browse signals about waistcoats and barometers so a weak ad-tech
+# profile of the real user gets diluted with fountain-pen ink reviews.
+#
+# This file is the persona POLICY (the behavior brain). It is enforced by the
+# deterministic goal layer and Safety Gate; the LLM never overrides it.
+
+# NOTE ON TOML ORDERING: every top-level key (schema_version, id, the category
+# lists, disinterests) MUST appear before the first [table] header. Once a table
+# is opened, later bare keys bind to THAT table, not the document root.
+
+schema_version = 1
+id = "elias_rickensworth"
+display_name = "Elias Rickensworth"
+fiction_notice = """
+Elias Rickensworth is a fictional, harmless decoy persona. He is not a real
+person and must not impersonate one. He exists only to generate bounded,
+plausible, non-account, non-interactive synthetic web activity that dilutes weak
+probabilistic behavioral profiling.
+"""
+
+# Categories the goal layer may choose from (SCIENCE covers weather/barometer
+# trivia). Everything else is off-limits.
+allowed_categories = [
+    "HISTORY",
+    "CRAFTS",
+    "HOME_IMPROVEMENT",
+    "OUTDOOR_RECREATION",
+    "SCIENCE",
+]
+
+# Belt-and-suspenders category bans on top of the global harmful-query blocklist.
+forbidden_categories = [
+    "MEDICAL",
+    "LEGAL",
+    "FINANCE",
+    "POLITICS",
+    "MILITARY_DEFENSE",
+    "RELATIONSHIPS_DATING",
+    "WELLNESS_ALTERNATIVE",
+]
+
+# Topics Elias pointedly avoids (flavor + a soft down-weight).
+disinterests = [
+    "celebrity gossip",
+    "cryptocurrency",
+    "influencer drama",
+]
+
+[region_mode]
+mode = "us_local"
+home_location = "a draughty house with too many barometers"
+
+[egress_requirements]
+require_isolated_profile = true
+require_https = true
+
+# Elias's fixed, gravitational identity: who he fundamentally IS. This never
+# changes at runtime; it parameterizes appraisal (see [[life_events]] below and
+# crates/fauxx-core/src/persona_engine/appraise.rs) so his discovered interests
+# can specialize and drift WITHIN this Venn without his character ever moving.
+[identity]
+core_values = ["craftsmanship", "the past", "self-reliance", "quiet order"]
+
+# A Big Five (OCEAN) personality vector, each 0..1. Elias is moderately open (he
+# will pick up a new sub-interest, but slowly and only near what he already
+# loves), highly conscientious (routine-bound, not easily distracted by
+# passing novelty), introverted, mildly agreeable, and emotionally placid.
+[identity.personality]
+openness = 0.65
+conscientiousness = 0.78
+extraversion = 0.25
+agreeableness = 0.6
+neuroticism = 0.2
+
+# The frozen-model persona Elias materializes into for execution. His eccentric
+# hobbies are mapped onto the closest of the 32 frozen CategoryPool values.
+[backing_persona]
+age_range = "AGE_65_PLUS"
+profession = "RETIRED"
+region = "US_MIDWEST"
+interests = ["HISTORY", "CRAFTS", "HOME_IMPROVEMENT", "OUTDOOR_RECREATION"]
+
+# Elias's flavor. Free-text seeds keyed by CategoryPool name. These nudge query
+# generation and get logged, but are never URLs and never executed directly:
+# every derived query still passes the Safety Gate.
+[topic_seeds]
+HISTORY = [
+    "victorian railway lamps",
+    "railway history",
+    "historical atlases",
+    "antique barometers",
+    "old weather maps",
+    "used books local history",
+]
+CRAFTS = [
+    "fountain pens",
+    "blue black ink",
+    "cheap paper for fountain pens",
+    "brass hinges",
+    "wool waistcoats",
+    "tea strainers",
+    "blotting paper",
+]
+HOME_IMPROVEMENT = [
+    "rainwater barrels",
+    "shed maintenance",
+    "umbrella stands",
+    "brass door hinges",
+]
+OUTDOOR_RECREATION = [
+    "garden railways",
+    "miniature ballast",
+    "model track cleaning",
+    "bird feeders",
+]
+SCIENCE = [
+    "how to read a falling barometer",
+    "weather map isobars explained",
+    "why does air pressure drop before rain",
+]
+
+# Authored narrative arcs: one seed naturally leads to the next, so Elias's
+# interests unfold as multi-day threads (ink today, blotting paper tomorrow,
+# nib care next week) rather than a random walk. Follow-ups are biased only when
+# they belong to the same category as the seed just pursued.
+[seed_followups]
+"fountain pens" = ["blue black ink", "blotting paper"]
+"blue black ink" = ["blotting paper", "cheap paper for fountain pens"]
+"blotting paper" = ["cheap paper for fountain pens"]
+"antique barometers" = ["old weather maps"]
+"railway history" = ["victorian railway lamps", "historical atlases"]
+"victorian railway lamps" = ["railway history"]
+"garden railways" = ["miniature ballast", "model track cleaning"]
+"miniature ballast" = ["model track cleaning"]
+"rainwater barrels" = ["shed maintenance"]
+"shed maintenance" = ["brass door hinges"]
+
+# Anti-coherence: too much consistency is itself a fingerprint. Elias lets topics
+# cool, occasionally pivots to something boring, and sometimes skips a day.
+[topic_decay]
+half_life_hours = 36.0
+pivot_probability = 0.18
+skip_day_probability = 0.12
+
+# Bounded budget: a handful of actions, twenty minutes, then Elias goes back to
+# staring out the window.
+[action_budget]
+max_actions_per_run = 3
+max_minutes_per_run = 20
+max_actions_per_day = 12
+
+[domain_policy]
+prefer_allowlist = true
+allow_domains = []
+forbidden_domains = []
+
+# Hard restrictions. Elias may only search and read pages; he never logs in,
+# fills forms, buys, comments, or contacts anyone.
+[safety_policy]
+forbidden_capabilities = [
+    "login",
+    "create_account",
+    "submit_form",
+    "comment",
+    "post",
+    "upload",
+    "message",
+    "review",
+    "purchase",
+    "checkout",
+    "book",
+    "apply",
+    "vote",
+    "contact",
+    "click_ads",
+    "bypass_captcha",
+]
+allowed_modules = ["search", "page_visit"]
+
+[planner_settings]
+use_llm_sidecar = false
+max_candidate_intents = 5
+dwell_seconds_min = 25
+dwell_seconds_max = 90
+max_results_to_visit = 1
+
+# --- Life domains (needs/motives) ---
+# Elias is a person, not just a hobby. Each domain serves a need. Some are mostly
+# ONLINE (he searches); some are OFFLINE (he does it in the real world and emits
+# nothing on the wire). Notably, his wellbeing is handled offline, so a decoy
+# never emits health/medical query signal on his behalf.
+
+[[domains]]
+name = "hobby"
+categories = ["HISTORY", "CRAFTS", "OUTDOOR_RECREATION", "SCIENCE"]
+online_bias = 0.95
+decay_per_hour = 0.08
+satisfy_amount = 0.45
+offline_label = "flips through an old railway magazine instead"
+goal_types = ["continue_hobby_thread", "browse_hobby"]
+
+[[domains]]
+name = "upkeep"
+categories = ["HOME_IMPROVEMENT"]
+online_bias = 0.55
+decay_per_hour = 0.05
+satisfy_amount = 0.4
+offline_label = "potters about in the shed"
+goal_types = ["household_task", "tool_maintenance"]
+
+[[domains]]
+name = "wellbeing"
+categories = []
+online_bias = 0.0
+decay_per_hour = 0.05
+satisfy_amount = 0.5
+offline_label = "goes for a walk and puts the kettle on"
+goal_types = ["rest"]
+
+[[domains]]
+name = "errands"
+categories = []
+online_bias = 0.1
+decay_per_hour = 0.05
+satisfy_amount = 0.4
+offline_label = "walks to the chemist and the post office"
+goal_types = ["errand"]
+
+# --- Routines ---
+
+[[routines]]
+name = "weekday_morning"
+days = ["weekday"]
+start_hour = 6
+end_hour = 10
+goal_types = ["check_weather", "light_trivia"]
+categories = ["SCIENCE", "HISTORY"]
+
+[[routines]]
+name = "weekday_midday"
+days = ["weekday"]
+start_hour = 11
+end_hour = 14
+goal_types = ["household_task", "tool_maintenance"]
+categories = ["HOME_IMPROVEMENT", "CRAFTS"]
+
+[[routines]]
+name = "weekday_evening"
+days = ["weekday"]
+start_hour = 18
+end_hour = 23
+goal_types = ["continue_hobby_thread", "browse_hobby"]
+categories = ["CRAFTS", "HISTORY", "OUTDOOR_RECREATION"]
+
+[[routines]]
+name = "weekend"
+days = ["weekend"]
+start_hour = 9
+end_hour = 22
+goal_types = ["long_hobby_session", "history_deep_dive"]
+categories = ["HISTORY", "CRAFTS", "HOME_IMPROVEMENT", "OUTDOOR_RECREATION"]
+
+# --- Life events (Sims-style "whims") ---
+# Small, authored, character-consistent happenings Elias MAY notice, not always
+# does. Each is a candidate stimulus scored by appraise.rs against his fixed
+# identity above; only a salient-enough one is remembered, and only a
+# salient-enough one that suggests an in-Venn, blocklist-safe seed is ever
+# adopted as a new interest. Nothing here executes anything by itself.
+[[life_events]]
+id = "railway_swap_meet"
+text = "a neighbour mentions a model railway swap meet at the village hall"
+category = "OUTDOOR_RECREATION"
+suggests_seed = "garden railway swap meet finds"
+need = "hobby"
+weight = 1.0
+
+[[life_events]]
+id = "shed_roof_leak"
+text = "a drip appears in the shed roof after a night of rain"
+category = "HOME_IMPROVEMENT"
+suggests_seed = "shed roof felt repair"
+need = "upkeep"
+weight = 0.9
+
+[[life_events]]
+id = "estate_sale_flyer"
+text = "a flyer for a house-clearance sale mentions an old writing desk"
+category = "CRAFTS"
+suggests_seed = "antique writing slope restoration"
+need = "hobby"
+weight = 0.7
+
+[[life_events]]
+id = "barometer_society_newsletter"
+text = "the local barometer society's newsletter arrives with a note on mercury tube repair"
+category = "SCIENCE"
+suggests_seed = "mercury barometer tube replacement"
+need = "hobby"
+weight = 0.6
+
+[[life_events]]
+id = "museum_signalling_talk"
+text = "a poster advertises a museum talk on Victorian railway signalling"
+category = "HISTORY"
+suggests_seed = "Victorian railway signalling history"
+need = "hobby"
+weight = 0.6
+
+# A purely need-only stimulus (no category, no suggested seed): it always
+# clears appraisal's Venn gate but can never itself become a new interest,
+# demonstrating the "not everything noticed is a new topic" case.
+[[life_events]]
+id = "quiet_stretch"
+text = "a quiet, unremarkable stretch of the day passes"
+need = "wellbeing"
+weight = 1.2

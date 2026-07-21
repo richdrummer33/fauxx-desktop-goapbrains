@@ -158,6 +158,16 @@ pub enum CoreError {
     #[error("mqtt error: {0}")]
     Mqtt(String),
 
+    /// Persona-engine (decoy behavior layer) failure: a policy file that fails to
+    /// parse or validate (unknown category, forbidden-and-allowed overlap, empty
+    /// routines, bad budget), an unknown built-in/persona-policy id, or malformed
+    /// persisted behavior state. Distinct so callers can tell a policy/behavior
+    /// problem apart from a store/browser failure. The Safety Gate refusing an
+    /// action is NOT this error: a refused action is a recorded, expected outcome
+    /// (a skip), never a hard failure.
+    #[error("persona-engine error: {0}")]
+    PersonaEngine(String),
+
     /// Debug-logging / log-export failure (the bug-report path): the OS log
     /// directory could not be resolved or created, a log file could not be read,
     /// or the scrubbed export could not be written. Distinct so a logging problem

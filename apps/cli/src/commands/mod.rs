@@ -40,6 +40,7 @@ pub mod pack;
 pub mod pair;
 pub mod peers;
 pub mod persona;
+pub mod persona_engine;
 pub mod run;
 pub mod schedule;
 pub mod search;

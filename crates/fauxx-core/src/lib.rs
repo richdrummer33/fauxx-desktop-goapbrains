@@ -53,6 +53,7 @@ pub mod mqtt;
 pub mod network;
 pub mod orchestration;
 pub mod persona;
+pub mod persona_engine;
 pub mod personapack;
 pub mod querybank;
 pub mod store;
@@ -120,6 +121,12 @@ pub use orchestration::{
     IpRecommendation, PublicIpSource, ScheduledAction, SharedIpState, WanIpAssessment,
 };
 pub use persona::SyntheticPersona;
+pub use persona_engine::{
+    ActivityRecord, BehaviorKernel, BehaviorState, DecoyGoal, DisabledAssistant, DryRunReport,
+    GoalLayer, Intent, LlmConfig, PersonaEngineRunOutcome, PersonaPolicy, Planner, PolicyIssue,
+    PolicySummary, SafetyDecision, SafetyGate, SemanticAssistant, SidecarConstraints,
+    POLICY_SCHEMA_VERSION,
+};
 pub use personapack::{
     sign_pack, sign_pack_with, verify_pack, verify_parsed_pack, PackContent, PackError,
     PackProvenance, PackRecord, PackSigningKey, PersonaPack, CURRENT_PACK_SCHEMA_VERSION,
@@ -3198,6 +3205,327 @@ impl Core {
             .await
     }
 
+    // --- Persona engine: the decoy behavior layer (Sims-like) ------------------
+    //     Policy -> Behavior Kernel -> Goal Layer -> Planner -> (opt) LLM Sidecar
+    //     -> Safety Gate -> Executor -> Logs. The deterministic control layer
+    //     drives; the LLM sidecar is disabled in the MVP.
+
+    /// List the built-in persona-engine policies as summaries.
+    pub fn persona_engine_builtins(&self) -> Vec<PolicySummary> {
+        persona_engine::builtins::list()
+            .iter()
+            .filter_map(|id| {
+                persona_engine::builtins::get(id)
+                    .ok()
+                    .map(|p| PolicySummary::from_policy(&p, true))
+            })
+            .collect()
+    }
+
+    /// Resolve a built-in persona-engine policy by id.
+    pub fn persona_engine_builtin(&self, id: &str) -> Result<PersonaPolicy> {
+        persona_engine::builtins::get(id)
+    }
+
+    /// Compute a DRY-RUN planning report for `policy`: advance a copy of any
+    /// persisted behavior state, select a goal, plan candidate intents, and run
+    /// the Safety Gate. It never drives the decoy browser and never persists the
+    /// advanced state. `now` is epoch millis; `seed` makes the pass reproducible.
+    /// `llm` is the optional local LLM sidecar config; `None` (or a config with
+    /// `enabled: false`) uses the deterministic-only [`DisabledAssistant`] and
+    /// makes no network call at all. With `llm` enabled, this is NOT
+    /// network-free: sensing/appraisal (and, on a day boundary, reflection) may
+    /// make a real loopback HTTP call to the configured LM Studio endpoint. See
+    /// [`DryRunReport::no_network`](persona_engine::DryRunReport::no_network),
+    /// which reflects this honestly rather than asserting a blanket guarantee.
+    pub async fn persona_engine_plan(
+        &self,
+        policy: &PersonaPolicy,
+        now: i64,
+        seed: u64,
+        llm: Option<LlmConfig>,
+    ) -> Result<DryRunReport> {
+        let mut state = self.persona_engine_state_or_new(&policy.id).await?;
+        let gate = SafetyGate::new();
+        let sidecar = build_sidecar(llm);
+        Ok(persona_engine::plan_tick(
+            policy,
+            &mut state,
+            sidecar.as_ref(),
+            &gate,
+            now,
+            seed,
+        ))
+    }
+
+    /// Run ONE persona-engine tick for `policy`.
+    ///
+    /// In `dry_run` this is [`persona_engine_plan`](Self::persona_engine_plan)
+    /// wrapped as an outcome: nothing is persisted and no browser is driven. On a
+    /// live run it materializes the backing persona (into the store, once),
+    /// launches the persona's isolated decoy browser, dispatches the
+    /// Safety-Gate-approved queries through the guarded search path, persists the
+    /// advanced behavior state and the activity log, and returns the outcome.
+    /// Requires an open store for a live run. `llm` is the optional local LLM
+    /// sidecar config (see [`persona_engine_plan`](Self::persona_engine_plan));
+    /// it never chooses URLs or action types and never bypasses the Safety Gate.
+    pub async fn persona_engine_run_once(
+        &self,
+        policy: &PersonaPolicy,
+        decoy_id: Option<String>,
+        now: i64,
+        seed: u64,
+        dry_run: bool,
+        llm: Option<LlmConfig>,
+    ) -> Result<PersonaEngineRunOutcome> {
+        let mut state = self.persona_engine_state_or_new(&policy.id).await?;
+        let gate = SafetyGate::new();
+        let sidecar = build_sidecar(llm);
+        let report =
+            persona_engine::plan_tick(policy, &mut state, sidecar.as_ref(), &gate, now, seed);
+
+        if dry_run {
+            return Ok(PersonaEngineRunOutcome {
+                report,
+                executed: false,
+                dispatched: 0,
+                skipped: 0,
+                activity: Vec::new(),
+            });
+        }
+
+        let store = self.inner.store.as_ref().ok_or_else(|| {
+            CoreError::PersonaEngine("run-once (live) requires an open store".to_string())
+        })?;
+
+        let goal_type = report
+            .selected_goal
+            .as_ref()
+            .map(|g| g.goal_type.clone())
+            .unwrap_or_else(|| "idle".to_string());
+
+        // Records for safety-REJECTED candidate intents (recorded skips).
+        let mut activity: Vec<ActivityRecord> = Vec::new();
+        for decision in &report.safety_decisions {
+            if !decision.allowed {
+                if let Some(intent) = report
+                    .candidate_intents
+                    .iter()
+                    .find(|i| i.id == decision.intent_id)
+                {
+                    activity.push(persona_engine::make_activity_record(
+                        policy,
+                        report.current_routine.clone(),
+                        &goal_type,
+                        intent,
+                        &decision.reason,
+                        "skipped",
+                        None,
+                        None,
+                        now,
+                    ));
+                }
+            }
+        }
+
+        // Offline goal: the persona attends to a need in the real world. Satisfy
+        // the need, log an offline record, persist. No browser, no network.
+        if let Some(goal) = report.selected_goal.as_ref().filter(|g| !g.online) {
+            let amount = policy
+                .domain_by_need(&goal.need)
+                .map(|d| d.satisfy_amount)
+                .unwrap_or(0.4);
+            state.needs.satisfy(&goal.need, amount);
+            activity.push(persona_engine::make_offline_record(policy, goal, now));
+            let rejected = activity.len().saturating_sub(1);
+            let guard = store.lock().await;
+            guard.upsert_persona_engine_state(&state)?;
+            for rec in &activity {
+                guard.append_persona_engine_activity(rec)?;
+            }
+            return Ok(PersonaEngineRunOutcome {
+                report,
+                executed: false,
+                dispatched: 0,
+                skipped: rejected,
+                activity,
+            });
+        }
+
+        // Idle or nothing approved: persist the advanced state + rejection log.
+        if report.idle || report.final_plan.is_empty() {
+            let guard = store.lock().await;
+            guard.upsert_persona_engine_state(&state)?;
+            for rec in &activity {
+                guard.append_persona_engine_activity(rec)?;
+            }
+            let skipped = activity.len();
+            return Ok(PersonaEngineRunOutcome {
+                report,
+                executed: false,
+                dispatched: 0,
+                skipped,
+                activity,
+            });
+        }
+
+        let goal_need = report
+            .selected_goal
+            .as_ref()
+            .map(|g| g.need.clone())
+            .unwrap_or_default();
+
+        // Materialize + persist the backing persona (once) so the existing
+        // browser/egress path can drive it.
+        let persona = persona_engine::backing_persona_for(policy, now);
+        {
+            let guard = store.lock().await;
+            if guard.get_persona(&persona.id)?.is_none() {
+                guard.save_persona(&persona)?;
+            }
+        }
+        let decoy_id = decoy_id.unwrap_or_else(|| format!("persona-engine-{}", policy.id));
+
+        // Launch, dispatch the approved queries through the guarded path, close.
+        let browser = self
+            .launch_persona_decoy_browser_live(&persona.id, &decoy_id)
+            .await?;
+        let queries: Vec<(persona::CategoryPool, String)> = report
+            .final_plan
+            .iter()
+            .filter_map(|i| {
+                persona::CategoryPool::from_name(&i.category).map(|c| (c, i.final_query.clone()))
+            })
+            .collect();
+        let search =
+            crate::browser::search::dispatch_planned_queries(&browser, &persona, &queries, seed)
+                .await;
+        let _ = browser.close().await;
+
+        // Turn the search outcome into activity records + state updates.
+        let mut dispatched = 0usize;
+        let mut skipped = 0usize;
+        for intent in &report.final_plan {
+            let hit = search
+                .dispatched
+                .iter()
+                .find(|d| d.query == intent.final_query);
+            if let Some(d) = hit {
+                state.record_action(&intent.category, &intent.query_seed, now);
+                // Sense: what he dispatched is itself something he encountered
+                // online. Appraise + ingest it, so the world-model reflects
+                // real activity, not just authored offline life events. With the
+                // sidecar disabled (the default), the deterministic path cannot
+                // invent a genuinely NEW topic from this; it mainly reinforces
+                // relevance for future appraisal. With an enabled LLM sidecar,
+                // `from_dispatched_query` asks it to propose a closely-related
+                // new topic (still Venn- and blocklist-gated before it can ever
+                // be adopted).
+                let online_stim = persona_engine::stimulus::from_dispatched_query(
+                    policy,
+                    &intent.category,
+                    &intent.query_seed,
+                    sidecar.as_ref(),
+                );
+                let online_appraisal = persona_engine::appraise::appraise(
+                    policy,
+                    &state,
+                    &online_stim,
+                    sidecar.as_ref(),
+                );
+                persona_engine::appraise::ingest(&mut state, &online_stim, &online_appraisal, now);
+                activity.push(persona_engine::make_activity_record(
+                    policy,
+                    report.current_routine.clone(),
+                    &goal_type,
+                    intent,
+                    "allowed",
+                    "dispatched",
+                    Some(d.engine.clone()),
+                    None,
+                    now,
+                ));
+                dispatched += 1;
+            } else {
+                let reason = search
+                    .skipped
+                    .iter()
+                    .find(|(q, _)| q.contains(&intent.final_query))
+                    .map(|(_, r)| r.clone())
+                    .unwrap_or_else(|| "not dispatched".to_string());
+                activity.push(persona_engine::make_activity_record(
+                    policy,
+                    report.current_routine.clone(),
+                    &goal_type,
+                    intent,
+                    "allowed",
+                    "skipped",
+                    None,
+                    Some(reason),
+                    now,
+                ));
+                skipped += 1;
+            }
+        }
+        // A dispatched session replenishes the serviced need.
+        if dispatched > 0 && !goal_need.is_empty() {
+            let amount = policy
+                .domain_by_need(&goal_need)
+                .map(|d| d.satisfy_amount)
+                .unwrap_or(0.4);
+            state.needs.satisfy(&goal_need, amount);
+        }
+        state.add_memory_summary(format!(
+            "{}: {dispatched} decoy searches ({skipped} skipped) during {}",
+            policy.display_name,
+            report
+                .current_routine
+                .clone()
+                .unwrap_or_else(|| "idle".to_string())
+        ));
+
+        {
+            let guard = store.lock().await;
+            guard.upsert_persona_engine_state(&state)?;
+            for rec in &activity {
+                guard.append_persona_engine_activity(rec)?;
+            }
+        }
+
+        Ok(PersonaEngineRunOutcome {
+            report,
+            executed: true,
+            dispatched,
+            skipped,
+            activity,
+        })
+    }
+
+    /// Export a persona's decoy activity log as a JSONL document (one
+    /// [`ActivityRecord`] per line, chronological). Empty when no store is
+    /// attached or the persona has no recorded activity.
+    pub async fn persona_engine_export_logs_jsonl(&self, persona_id: &str) -> Result<String> {
+        let records = match &self.inner.store {
+            Some(store) => store
+                .lock()
+                .await
+                .list_persona_engine_activity(Some(persona_id))?,
+            None => Vec::new(),
+        };
+        persona_engine::log::to_jsonl(&records)
+    }
+
+    /// Load a persona's persisted behavior state, or a fresh one when there is
+    /// none or no store is attached.
+    async fn persona_engine_state_or_new(&self, policy_id: &str) -> Result<BehaviorState> {
+        if let Some(store) = &self.inner.store {
+            if let Some(state) = store.lock().await.get_persona_engine_state(policy_id)? {
+                return Ok(state);
+            }
+        }
+        Ok(BehaviorState::new(policy_id))
+    }
+
     /// A stable per-INSTALL seed for the query-generation style, derived from the
     /// device sync identity's public key, so this install's query distribution is
     /// consistent across runs and distinct from other installs (the per-install
@@ -3214,6 +3542,24 @@ impl Core {
             // No sync identity: a fixed, arbitrary nonzero seed.
             None => 0xFAFA_FAFA_FAFA_FAFA,
         }
+    }
+}
+
+/// Build the persona-engine semantic sidecar for a planning/run-once call.
+/// `None`, or a config with `enabled: false`, always yields the deterministic
+/// [`DisabledAssistant`] (no runtime dependency on LM Studio, no network path);
+/// only an explicit, operator-supplied `LlmConfig { enabled: true, .. }` builds
+/// a real [`persona_engine::llm::LmStudioAssistant`] talking to the local
+/// endpoint it names.
+fn build_sidecar(llm: Option<LlmConfig>) -> Box<dyn SemanticAssistant> {
+    match llm {
+        Some(config) if config.enabled => {
+            let transport = persona_engine::llm::LmStudioTransport::new(&config);
+            Box::new(persona_engine::llm::LmStudioAssistant::new(
+                config, transport,
+            ))
+        }
+        _ => Box::new(DisabledAssistant),
     }
 }
 

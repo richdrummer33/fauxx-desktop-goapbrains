@@ -261,6 +261,47 @@ pub async fn run_search_session(
     Ok(outcome)
 }
 
+/// Dispatch a list of ALREADY-APPROVED queries through the guarded search path.
+///
+/// This is the persona-engine executor entrypoint: unlike
+/// [`run_search_session`], it does NOT generate its own queries. The caller (the
+/// persona engine's goal layer + planner + Safety Gate) has already chosen and
+/// vetted each `(category, query)` pair, so this only builds the SERP URL and
+/// navigates it through the SAME R3 guardrail (`dispatch_one` -> HTTPS-only +
+/// auth-flow blocklist), dwelling with the persona's cadence. Each query MUST
+/// already be blocklist-vetted by the caller; a refused navigation is a recorded
+/// skip, not an error. `seed` makes engine choice + dwell reproducible.
+pub async fn dispatch_planned_queries(
+    browser: &DecoyBrowser,
+    persona: &SyntheticPersona,
+    queries: &[(CategoryPool, String)],
+    seed: u64,
+) -> SearchOutcome {
+    let mut outcome = SearchOutcome::default();
+    let mut rng = StdRng::seed_from_u64(seed);
+    for (category, query) in queries {
+        let engine = &SEARCH_ENGINES[rng.random_range(0..SEARCH_ENGINES.len())];
+        dispatch_one(
+            browser,
+            engine,
+            query,
+            *category,
+            persona,
+            seed,
+            &mut outcome,
+        )
+        .await;
+    }
+    tracing::info!(
+        target: "fauxx_core::browser::search",
+        persona_id = %persona.id,
+        dispatched = outcome.dispatched.len(),
+        skipped = outcome.skipped.len(),
+        "dispatched persona-engine planned queries"
+    );
+    outcome
+}
+
 /// Map a persona's interest names to [`CategoryPool`] (skipping any unknown name),
 /// for the commercial-lean read.
 fn persona_categories(persona: &SyntheticPersona) -> Vec<CategoryPool> {

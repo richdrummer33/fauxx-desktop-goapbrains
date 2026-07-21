@@ -28,7 +28,7 @@ use rusqlite::Connection;
 use crate::error::Result;
 
 /// The schema version this build expects. Equals the number of migrations.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// Ordered, forward-only migrations. Migration `i` upgrades the database from
 /// version `i` to version `i + 1`. Never edit a shipped migration; append a new
@@ -444,6 +444,40 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_campaigns_persona ON campaigns (persona_id);
     CREATE INDEX idx_campaigns_status ON campaigns (status, updated_at);
+    ",
+    // v15 -> v16: the persona engine (the Sims-like decoy behavior layer).
+    //
+    // `persona_engine_state` persists ONE evolving BehaviorState per persona
+    // POLICY id (energy, curiosity, boredom, per-topic momentum, cooldowns,
+    // recent history), so continuity survives a restart (Elias's fountain-pen
+    // momentum yesterday still nudges his choices today). The full BehaviorState
+    // JSON is stored verbatim; `persona_id` is the natural key so an advance
+    // upserts. This is desktop-local decoy state, NOT the synced wire persona.
+    //
+    // `persona_engine_activity` is the append-only decoy activity log: one row
+    // per planned/executed decoy action, carrying the full ActivityRecord JSON
+    // (routine, goal, category, the SYNTHETIC query, the SERP domain, dwell, the
+    // safety outcome). These are decoy-only records with NO secrets, tokens,
+    // cookies, or real-user data (frozen by a log-schema test). They export to a
+    // local JSONL file via `persona-engine logs export`. No foreign key: the log
+    // must survive a persona being edited or removed.
+    "
+    CREATE TABLE persona_engine_state (
+        persona_id   TEXT PRIMARY KEY NOT NULL,
+        -- The exact BehaviorState JSON, stored verbatim.
+        json         TEXT NOT NULL,
+        updated_at   INTEGER NOT NULL
+    );
+
+    CREATE TABLE persona_engine_activity (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        persona_id   TEXT NOT NULL,
+        recorded_at  INTEGER NOT NULL,
+        -- The exact ActivityRecord JSON (decoy-only; no secrets), stored verbatim.
+        json         TEXT NOT NULL
+    );
+    CREATE INDEX idx_persona_engine_activity_persona
+        ON persona_engine_activity (persona_id, recorded_at);
     ",
 ];
 

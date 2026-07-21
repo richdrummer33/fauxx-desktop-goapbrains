@@ -211,6 +211,16 @@ ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std
 regex = { version = "=1.12.4", default-features = false, features = ["std", "unicode"] }
 unicode-normalization = "=0.1.25"
 
+# --- Persona-engine decoy behavior layer (persona policy files) ---
+# TOML parser for the human-authored persona POLICY files (the Sims-like decoy
+# behavior layer). TOML is chosen over YAML because it is comment-friendly for
+# hand-authored policies, actively maintained, and MIT/Apache (clean under
+# deny.toml, unlike the deprecated serde_yaml). Pinned to =0.8.2, the version
+# already resolved transitively, so no new distinct graph version is introduced.
+# Built-in personas (Elias) are additionally bundled via include_str! like every
+# other dataset in the tree.
+toml = "=0.8.2"
+
 # Hardened, reproducibility-friendly release profile (mirrors cairn). The
 # byte-for-byte reproducibility work (SOURCE_DATE_EPOCH, path remap) lands in
 # C0 #6; these flags are the baseline.

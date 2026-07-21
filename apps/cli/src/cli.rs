@@ -328,6 +328,16 @@ pub enum Command {
         command: CampaignCommand,
     },
 
+    /// Persona engine: a Sims-like decoy behavior layer. Runs a deterministic
+    /// Policy -> Kernel -> Goal -> Planner -> Safety -> Executor pipeline for a
+    /// built-in persona (e.g. Elias Rickensworth). The LLM sidecar is disabled in
+    /// the MVP; every action is safety-gated and bounded.
+    #[command(name = "persona-engine")]
+    PersonaEngine {
+        #[command(subcommand)]
+        command: PersonaEngineCommand,
+    },
+
     /// Long-running headless homelab mode driven by a config file (C8 #35).
     Serve(ServeArgs),
 
@@ -965,6 +975,139 @@ pub enum CampaignCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// The `fauxx-cli persona-engine ...` subcommands (the decoy behavior layer).
+#[derive(Subcommand, Debug)]
+pub enum PersonaEngineCommand {
+    /// List the built-in persona-engine policies.
+    List {
+        /// Emit the list as JSON instead of a summary table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show one persona policy by id (or a path to a .toml file).
+    Show {
+        /// A built-in policy id (e.g. `elias_rickensworth`) or a .toml path.
+        name: String,
+        /// Emit the full policy as JSON instead of a summary.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Validate a persona policy: a built-in id, or a path to a .toml file.
+    Validate {
+        /// A built-in policy id, or a path to a policy .toml file.
+        target: String,
+    },
+
+    /// Dry-run the decision pipeline for a persona: show the routine, behavior
+    /// state, goal/utility scores, candidate intents, safety decision, and final
+    /// plan. Never drives the browser or writes to the store. Network-free UNLESS
+    /// `--llm` is passed, in which case sensing/appraisal may call out to the
+    /// local LLM server (see the report's `no_network` field).
+    Plan {
+        /// The persona policy id (or a .toml path).
+        #[arg(long)]
+        persona: String,
+        /// Accepted for symmetry with `run-once`; `plan` is always a dry-run.
+        #[arg(long)]
+        dry_run: bool,
+        /// Seed making the pass reproducible.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Override "now" as epoch millis (default: the wall clock).
+        #[arg(long, value_name = "MILLIS")]
+        now: Option<i64>,
+        /// Emit the dry-run report as JSON instead of a summary.
+        #[arg(long)]
+        json: bool,
+        /// Opt in to the optional local LLM sidecar (LM Studio). Off by
+        /// default: the deterministic pipeline never needs it, and a disabled
+        /// sidecar never calls out.
+        #[arg(long)]
+        llm: bool,
+        /// The LM Studio server's `host:port` (only used with `--llm`).
+        #[arg(long, default_value = "127.0.0.1:1234", value_name = "HOST:PORT")]
+        llm_endpoint: String,
+        /// The model id LM Studio has loaded (only used with `--llm`).
+        #[arg(long, default_value = "local-model")]
+        llm_model: String,
+        /// Bearer token for an LM Studio server with "Require Authentication"
+        /// enabled (only used with `--llm`; omit for the unauthenticated default).
+        #[arg(long, value_name = "TOKEN")]
+        llm_api_key: Option<String>,
+    },
+
+    /// Run ONE tick for a persona. With `--dry-run` this is exactly `plan`.
+    /// Otherwise it drives the persona's isolated decoy browser through the
+    /// safety-approved plan (requires a system Chromium and an open store).
+    RunOnce {
+        /// The persona policy id (or a .toml path).
+        #[arg(long)]
+        persona: String,
+        /// Plan only; do not drive the browser or persist anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the decoy-profile id (default: `persona-engine-<id>`).
+        #[arg(long)]
+        decoy_id: Option<String>,
+        /// Seed making the pass reproducible.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Override "now" as epoch millis (default: the wall clock).
+        #[arg(long, value_name = "MILLIS")]
+        now: Option<i64>,
+        /// Emit the outcome as JSON instead of a summary.
+        #[arg(long)]
+        json: bool,
+        /// Opt in to the optional local LLM sidecar (LM Studio). Off by
+        /// default: the deterministic pipeline never needs it, and a disabled
+        /// sidecar never calls out.
+        #[arg(long)]
+        llm: bool,
+        /// The LM Studio server's `host:port` (only used with `--llm`).
+        #[arg(long, default_value = "127.0.0.1:1234", value_name = "HOST:PORT")]
+        llm_endpoint: String,
+        /// The model id LM Studio has loaded (only used with `--llm`).
+        #[arg(long, default_value = "local-model")]
+        llm_model: String,
+        /// Bearer token for an LM Studio server with "Require Authentication"
+        /// enabled (only used with `--llm`; omit for the unauthenticated default).
+        #[arg(long, value_name = "TOKEN")]
+        llm_api_key: Option<String>,
+    },
+
+    /// Decoy activity logs for a persona.
+    Logs {
+        #[command(subcommand)]
+        command: PersonaEngineLogsCommand,
+    },
+}
+
+/// The `fauxx-cli persona-engine logs ...` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum PersonaEngineLogsCommand {
+    /// Export a persona's decoy activity log.
+    Export {
+        /// The persona policy id.
+        #[arg(long)]
+        persona: String,
+        /// The export format (JSONL only in the MVP).
+        #[arg(long, value_enum, default_value_t = PersonaEngineLogFormat::Jsonl)]
+        format: PersonaEngineLogFormat,
+        /// Write to this file instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+}
+
+/// The persona-engine log export formats (JSONL only in the MVP).
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum PersonaEngineLogFormat {
+    /// One JSON object per line.
+    Jsonl,
 }
 
 /// The goal comparators accepted on the CLI (C8 #33).

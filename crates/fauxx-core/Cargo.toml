@@ -125,6 +125,14 @@ ed25519-dalek = { workspace = true }
 regex = { workspace = true }
 unicode-normalization = { workspace = true }
 
+# --- Persona-engine decoy behavior layer ---
+# TOML parser for the persona POLICY files (the Sims-like decoy behavior layer:
+# who a persona is allowed to be, routines, budgets, safety). Human-authored and
+# comment-friendly; MIT/Apache (deny-friendly). Built-in personas are also
+# bundled via include_str! per the house convention. Pinned in the root
+# [workspace.dependencies].
+toml = { workspace = true }
+
 # --- Orchestration & UX: Home Assistant / MQTT hooks (C8 #36 U5) ---
 # MQTT client for the Home Assistant integration (status/efficacy discovery
 # sensors + a campaign command topic). OPTIONAL and behind the off-by-default
